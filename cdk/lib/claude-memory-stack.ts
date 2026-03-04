@@ -100,6 +100,7 @@ export class ClaudeMemoryStack extends cdk.Stack {
       cognitoDomain: {
         domainPrefix: `claude-memory-auth-${this.account}`,
       },
+      managedLoginVersion: cognito.ManagedLoginVersion.NEWER_MANAGED_LOGIN,
     });
 
     // ========== API Gateway HTTP API ==========
