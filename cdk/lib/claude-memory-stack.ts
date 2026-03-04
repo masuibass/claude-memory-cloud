@@ -133,6 +133,13 @@ export class ClaudeMemoryStack extends cdk.Stack {
       authFlows: { userSrp: true },
     });
 
+    // ========== Managed Login Branding ==========
+    new cognito.CfnManagedLoginBranding(this, "ManagedLoginBranding", {
+      userPoolId: userPool.userPoolId,
+      clientId: appClient.userPoolClientId,
+      useCognitoProvidedValues: true,
+    });
+
     // ========== Secrets Manager ==========
     const oauthSecret = new secretsmanager.Secret(this, "MemoryOAuthSecret", {
       secretName: "claude-memory-cloud/oauth-secret",
