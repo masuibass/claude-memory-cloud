@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aws_sdk_bedrockruntime::Client as BedrockClient;
@@ -62,19 +61,6 @@ pub struct SearchTranscriptsInput {
     /// Optional session ID to search within
     pub session_id: Option<String>,
     /// Maximum number of results (default: 20, max: 100)
-    pub limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetTranscriptToolsInput {
-    /// Optional session ID to filter
-    pub session_id: Option<String>,
-    /// Optional tool name filter (e.g. "Read", "Bash")
-    pub tool_name: Option<String>,
-    /// Include tool output in results (default: false)
-    #[serde(default)]
-    pub include_output: bool,
-    /// Maximum number of results (default: 50, max: 200)
     pub limit: Option<i64>,
 }
 
@@ -425,103 +411,6 @@ impl McpServer {
             .unwrap_or_else(|e| format!("JSON error: {e}"))
     }
 
-    /// Get tool usage records from transcripts, optionally with output.
-    #[tool(description = "Get tool usage history from transcripts. Shows which tools were called, their inputs, and optionally outputs. Filter by session or tool name.")]
-    async fn get_transcript_tools(
-        &self,
-        Parameters(input): Parameters<GetTranscriptToolsInput>,
-    ) -> String {
-        let account_id = match self.get_account_id().await {
-            Ok(id) => id,
-            Err(e) => return e,
-        };
-
-        let limit = input.limit.unwrap_or(50).min(200) as usize;
-
-        let s3_keys = match self.get_s3_keys(&account_id, input.session_id.as_deref(), 20).await {
-            Ok(keys) => keys,
-            Err(e) => return e,
-        };
-
-        let fetches = s3_keys
-            .iter()
-            .map(|key| fetch_transcript_bytes(&self.s3, &self.transcript_bucket, key));
-        let all_bytes = join_all(fetches).await;
-
-        #[derive(Serialize)]
-        struct Record {
-            session_id: String,
-            timestamp: Option<String>,
-            name: String,
-            input: serde_json::Value,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            output: Option<String>,
-        }
-
-        let mut records: Vec<Record> = Vec::new();
-
-        for (i, maybe_bytes) in all_bytes.into_iter().enumerate() {
-            let Some(bytes) = maybe_bytes else { continue };
-            let entries = parse_entries(&bytes);
-            let session_id = Self::session_id_from_key(&s3_keys[i], &account_id);
-
-            let mut tool_output_map: HashMap<String, String> = HashMap::new();
-            if input.include_output {
-                for entry in &entries {
-                    let Some(ref msg) = entry.message else {
-                        continue;
-                    };
-                    if entry.r#type == "user" {
-                        for result in extract_tool_results(&msg.content) {
-                            tool_output_map.insert(result.tool_use_id, result.content);
-                        }
-                    }
-                }
-            }
-
-            for entry in &entries {
-                let Some(ref msg) = entry.message else {
-                    continue;
-                };
-                let tool_uses = extract_tool_uses(&msg.content);
-                for (id, name, tool_input) in tool_uses {
-                    if let Some(ref filter) = input.tool_name {
-                        if !name.eq_ignore_ascii_case(filter) {
-                            continue;
-                        }
-                    }
-                    let output = if input.include_output {
-                        tool_output_map.get(&id).cloned()
-                    } else {
-                        None
-                    };
-                    records.push(Record {
-                        session_id: session_id.clone(),
-                        timestamp: entry.timestamp.clone(),
-                        name,
-                        input: tool_input,
-                        output,
-                    });
-                    if records.len() >= limit {
-                        break;
-                    }
-                }
-                if records.len() >= limit {
-                    break;
-                }
-            }
-            if records.len() >= limit {
-                break;
-            }
-        }
-
-        serde_json::to_string_pretty(&serde_json::json!({
-            "tool_uses": records,
-            "total": records.len(),
-        }))
-        .unwrap_or_else(|e| format!("JSON error: {e}"))
-    }
-
     /// Get parsed transcript for a specific session.
     #[tool(description = "Get parsed transcript for a session. Returns structured entries with text, tool uses, and optionally tool results.")]
     async fn get_transcript(
@@ -615,7 +504,7 @@ impl ServerHandler for McpServer {
             server_info: Implementation::from_build_env(),
             instructions: Some(
                 "Claude Memory Cloud - search and retrieve past conversation memories, \
-                 tool usage history, and find semantically similar content across all projects."
+                 and find semantically similar content across all projects."
                     .to_string(),
             ),
         }
