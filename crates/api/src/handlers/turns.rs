@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
@@ -88,4 +88,33 @@ async fn do_upsert(
     .await?;
 
     Ok(row.0)
+}
+
+pub async fn delete_session_turns(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let account_id = match extract_account_id_from_headers(&headers) {
+        Some(id) => id,
+        None => return (StatusCode::UNAUTHORIZED, "missing auth").into_response(),
+    };
+
+    let result = sqlx::query("DELETE FROM turns WHERE account_id = $1 AND session_id = $2")
+        .bind(&account_id)
+        .bind(&session_id)
+        .execute(&state.pool)
+        .await;
+
+    match result {
+        Ok(r) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": r.rows_affected()})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("delete_session_turns error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
 }

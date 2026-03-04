@@ -23,7 +23,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/sessions", get(sessions::list_sessions))
         .route(
             "/api/sessions/{sid}/turns",
-            get(sessions::get_session_turns),
+            get(sessions::get_session_turns).delete(turns::delete_session_turns),
         )
         .route("/api/turns/batch", post(turns::batch_upsert_turns))
         .route("/api/transcripts", post(transcripts::upload_transcript))
