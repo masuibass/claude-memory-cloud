@@ -1,0 +1,22 @@
+{
+  "name": "claude-memory-cloud-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "cdk": "cdk",
+    "deploy": "cdk deploy --profile individual",
+    "synth": "cdk synth --profile individual",
+    "diff": "cdk diff --profile individual",
+    "destroy": "cdk destroy --profile individual"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.178.0",
+    "constructs": "^10.4.2"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2.178.0",
+    "typescript": "~5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
