@@ -61,7 +61,18 @@ pub fn build_search_text(user_input: Option<&str>, tools_used: Option<&str>, ai_
             parts.push(truncated);
         }
     }
-    parts.join("\n")
+    let joined = parts.join("\n");
+    // Titan Embed v2 は 8192 トークン上限。安全マージンを取って約 20,000 文字で切る
+    const MAX_CHARS: usize = 20_000;
+    if joined.len() <= MAX_CHARS {
+        return joined;
+    }
+    let char_end = joined
+        .char_indices()
+        .nth(MAX_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(joined.len());
+    joined[..char_end].to_string()
 }
 
 #[derive(Debug, thiserror::Error)]
