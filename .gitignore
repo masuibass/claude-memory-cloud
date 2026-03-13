@@ -1,6 +1,8 @@
 target/
 cdk/node_modules/
 cdk/cdk.out/
+cdk/cdk.context.json
 .env*
 *.pem
 *.key
+CLAUDE.md

@@ -5,10 +5,10 @@
   "scripts": {
     "build": "tsc",
     "cdk": "cdk",
-    "deploy": "cdk deploy --profile individual",
-    "synth": "cdk synth --profile individual",
-    "diff": "cdk diff --profile individual",
-    "destroy": "cdk destroy --profile individual"
+    "deploy": "cdk deploy",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "destroy": "cdk destroy"
   },
   "dependencies": {
     "aws-cdk-lib": "^2.178.0",
