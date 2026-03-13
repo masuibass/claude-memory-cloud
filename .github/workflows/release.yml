@@ -48,6 +48,7 @@ jobs:
           cd ../../..
 
       - name: Attest build provenance
+        continue-on-error: true
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: memory-cloud-${{ matrix.target }}.tar.gz
