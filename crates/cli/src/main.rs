@@ -1,0 +1,367 @@
+mod config;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "memory-cloud", about = "Claude Code shared memory CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Set API URL and fetch Cognito config
+    Init {
+        /// API base URL (e.g. https://xxx.execute-api.amazonaws.com)
+        api_url: String,
+    },
+    /// Authenticate via Cognito (PKCE flow)
+    Login,
+    /// Semantic search across all transcripts
+    Recall {
+        /// Search query
+        query: String,
+        /// Number of results
+        #[arg(short = 'k', long, default_value = "5")]
+        top_k: i32,
+    },
+    /// Transcript operations
+    Transcript {
+        #[command(subcommand)]
+        action: TranscriptAction,
+    },
+    /// Session operations
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TranscriptAction {
+    /// Upload a transcript file
+    Put {
+        /// Path to the JSONL file
+        file: String,
+    },
+    /// Download a transcript
+    Get {
+        /// Session ID
+        session_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List your sessions
+    List,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Init { api_url } => cmd_init(&api_url).await,
+        Command::Login => cmd_login().await,
+        Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
+        Command::Transcript { action } => match action {
+            TranscriptAction::Put { file } => cmd_transcript_put(&file).await,
+            TranscriptAction::Get { session_id } => cmd_transcript_get(&session_id).await,
+        },
+        Command::Sessions { action } => match action {
+            SessionsAction::List => cmd_sessions_list().await,
+        },
+    }
+}
+
+// ---------- auth helper ----------
+
+/// Make an authenticated request. On 401, refresh tokens and retry once.
+async fn authed_request(
+    client: &reqwest::Client,
+    build: impl Fn(&str) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+    let token = config::load_id_token()?;
+    let resp = build(&token).send().await?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        eprintln!("Token expired, refreshing...");
+        let new_token = config::refresh_tokens().await?;
+        let resp = build(&new_token).send().await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized after refresh. Run `memory-cloud login`.".into());
+        }
+        return Ok(resp);
+    }
+
+    Ok(resp)
+}
+
+// ---------- init ----------
+
+async fn cmd_init(api_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = api_url.trim_end_matches('/');
+    let resp: serde_json::Value = reqwest::get(format!("{url}/config")).await?.json().await?;
+
+    let cognito_domain = resp["cognito_domain"]
+        .as_str()
+        .ok_or("missing cognito_domain")?;
+    let client_id = resp["client_id"].as_str().ok_or("missing client_id")?;
+
+    let cfg = config::Config {
+        api_url: url.to_string(),
+        cognito_domain: cognito_domain.to_string(),
+        client_id: client_id.to_string(),
+    };
+    config::save_config(&cfg)?;
+    println!("Config saved.");
+    println!("  API: {url}");
+    println!("  Cognito: {cognito_domain}");
+    println!("  Client ID: {client_id}");
+    println!("\nRun `memory-cloud login` to authenticate.");
+    Ok(())
+}
+
+// ---------- login ----------
+
+async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+
+    let server =
+        tiny_http::Server::http("127.0.0.1:8976").map_err(|e| format!("bind failed: {e}"))?;
+
+    let auth_url = format!(
+        "https://{}/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid+email+profile&code_challenge={}&code_challenge_method=S256",
+        cfg.cognito_domain,
+        cfg.client_id,
+        "http://localhost:8976/callback",
+        challenge,
+    );
+
+    println!("Opening browser for authentication...");
+    if open::that(&auth_url).is_err() {
+        println!("Open this URL in your browser:\n{auth_url}");
+    }
+
+    let request = server.recv()?;
+    let url = request.url().to_string();
+    let code = url
+        .split("code=")
+        .nth(1)
+        .and_then(|s| s.split('&').next())
+        .ok_or("no code in callback")?
+        .to_string();
+
+    let response = tiny_http::Response::from_string(
+        "<html><body><h2>Login successful!</h2><p>You can close this tab.</p></body></html>",
+    )
+    .with_header("Content-Type: text/html".parse::<tiny_http::Header>().unwrap());
+    let _ = request.respond(response);
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post(format!("https://{}/oauth2/token", cfg.cognito_domain))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &cfg.client_id),
+            ("code", &code),
+            ("redirect_uri", "http://localhost:8976/callback"),
+            ("code_verifier", &verifier),
+        ])
+        .send()
+        .await?;
+
+    if !token_resp.status().is_success() {
+        let body = token_resp.text().await?;
+        return Err(format!("Token exchange failed: {body}").into());
+    }
+
+    let tokens: serde_json::Value = token_resp.json().await?;
+    config::save_tokens(&tokens)?;
+
+    println!("Login successful!");
+    Ok(())
+}
+
+fn pkce_verifier() -> String {
+    use rand::Rng;
+    let bytes: Vec<u8> = (0..32).map(|_| rand::rng().random::<u8>()).collect();
+    base64_url_encode(&bytes)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(verifier.as_bytes());
+    base64_url_encode(&hash)
+}
+
+fn base64_url_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+// ---------- recall ----------
+
+async fn cmd_recall(query: &str, top_k: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/recall", cfg.api_url);
+    let body = serde_json::json!({ "query": query, "top_k": top_k });
+
+    let resp = authed_request(&client, |token| {
+        client.post(&url).bearer_auth(token).json(&body)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let results = body["results"].as_array().ok_or("unexpected response")?;
+
+    if results.is_empty() {
+        println!("No results found.");
+        return Ok(());
+    }
+
+    for r in results {
+        let session_id = r["session_id"].as_str().unwrap_or("?");
+        let score = r["score"].as_f64().unwrap_or(0.0);
+        let text = r["text"].as_str().unwrap_or("");
+        let preview: String = text.chars().take(200).collect();
+        println!("--- {session_id} (score: {score:.4}) ---");
+        println!("{preview}");
+        println!();
+    }
+    Ok(())
+}
+
+// ---------- transcript put ----------
+
+async fn cmd_transcript_put(file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+
+    let path = std::path::Path::new(file);
+    let session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid file path")?
+        .to_string();
+
+    let url = format!("{}/transcript", cfg.api_url);
+    let body = serde_json::json!({ "session_id": session_id });
+
+    let resp = authed_request(&client, |token| {
+        client.post(&url).bearer_auth(token).json(&body)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    let resp_body: serde_json::Value = resp.json().await?;
+    let upload_url = resp_body["upload_url"]
+        .as_str()
+        .ok_or("no upload_url")?;
+
+    let file_bytes = std::fs::read(file)?;
+    let size = file_bytes.len();
+    let put_resp = client.put(upload_url).body(file_bytes).send().await?;
+
+    if !put_resp.status().is_success() {
+        let status = put_resp.status();
+        let body = put_resp.text().await?;
+        return Err(format!("Upload failed: {status}: {body}").into());
+    }
+
+    println!("Uploaded {session_id} ({size} bytes)");
+    Ok(())
+}
+
+// ---------- transcript get ----------
+
+async fn cmd_transcript_get(session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let token = config::load_id_token()?;
+    let user_id = config::extract_sub_from_token(&token)?;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/transcript/{}/{}", cfg.api_url, user_id, session_id);
+
+    let resp = authed_request(&client, |token| {
+        client.get(&url).bearer_auth(token)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let download_url = body["download_url"].as_str().ok_or("no download_url")?;
+
+    let content = client.get(download_url).send().await?.text().await?;
+    print!("{content}");
+    Ok(())
+}
+
+// ---------- sessions list ----------
+
+async fn cmd_sessions_list() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/sessions", cfg.api_url);
+
+    let resp = authed_request(&client, |token| {
+        client.get(&url).bearer_auth(token)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let sessions = body["sessions"].as_array().ok_or("unexpected response")?;
+
+    if sessions.is_empty() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+
+    println!("{:<40} {:>10}  {}", "SESSION_ID", "SIZE", "LAST_MODIFIED");
+    for s in sessions {
+        let id = s["session_id"].as_str().unwrap_or("?");
+        let size = s["size"].as_i64().unwrap_or(0);
+        let modified = s["last_modified"].as_str().unwrap_or("?");
+        println!("{:<40} {:>10}  {}", id, format_size(size), modified);
+    }
+    Ok(())
+}
+
+fn format_size(bytes: i64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}

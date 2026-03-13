@@ -1,67 +1,19 @@
 import * as cdk from "aws-cdk-lib";
-import * as ec2 from "aws-cdk-lib/aws-ec2";
-import * as rds from "aws-cdk-lib/aws-rds";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as apigwv2integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as apigwv2authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as s3vectors from "aws-cdk-lib/aws-s3vectors";
+import * as bedrock from "aws-cdk-lib/aws-bedrock";
 import { Construct } from "constructs";
 import * as path from "path";
 
 export class ClaudeMemoryStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
-
-    // ========== VPC ==========
-    const vpc = new ec2.Vpc(this, "MemoryVpc", {
-      maxAzs: 2,
-      natGateways: 1,
-      subnetConfiguration: [
-        {
-          name: "Public",
-          subnetType: ec2.SubnetType.PUBLIC,
-          cidrMask: 24,
-        },
-        {
-          name: "Private",
-          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
-          cidrMask: 24,
-        },
-        {
-          name: "Isolated",
-          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
-          cidrMask: 24,
-        },
-      ],
-    });
-
-    // ========== Aurora Security Group ==========
-    const auroraSg = new ec2.SecurityGroup(this, "AuroraSg", {
-      vpc,
-      description: "Aurora Serverless v2 security group",
-    });
-
-    // ========== Aurora Serverless v2 (PostgreSQL) ==========
-    const auroraCluster = new rds.DatabaseCluster(this, "MemoryDb", {
-      engine: rds.DatabaseClusterEngine.auroraPostgres({
-        version: rds.AuroraPostgresEngineVersion.VER_16_4,
-      }),
-      serverlessV2MinCapacity: 0,
-      serverlessV2MaxCapacity: 2,
-      writer: rds.ClusterInstance.serverlessV2("Writer", {
-        scaleWithWriter: true,
-      }),
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
-      securityGroups: [auroraSg],
-      defaultDatabaseName: "memory",
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      enableDataApi: true,
-    });
 
     // ========== S3 Bucket (transcripts) ==========
     const transcriptBucket = new s3.Bucket(this, "TranscriptBucket", {
@@ -113,10 +65,10 @@ export class ClaudeMemoryStack extends cdk.Stack {
       },
     });
 
-    // ========== Cognito App Client ==========
-    const appClient = userPool.addClient("MemoryProxyClient", {
-      userPoolClientName: "memory-oauth-proxy",
-      generateSecret: true,
+    // ========== Cognito App Client (PKCE) ==========
+    const pkceClient = userPool.addClient("PkceClient", {
+      userPoolClientName: "memory-cloud-cli",
+      generateSecret: false,
       oAuth: {
         flows: { authorizationCodeGrant: true },
         scopes: [
@@ -124,271 +76,203 @@ export class ClaudeMemoryStack extends cdk.Stack {
           cognito.OAuthScope.EMAIL,
           cognito.OAuthScope.PROFILE,
         ],
-        callbackUrls: [`${httpApi.apiEndpoint}/callback`],
-        logoutUrls: [`${httpApi.apiEndpoint}`],
+        callbackUrls: ["http://localhost:8976/callback"],
+        logoutUrls: ["http://localhost:8976"],
       },
       supportedIdentityProviders: [
         cognito.UserPoolClientIdentityProvider.COGNITO,
       ],
-      authFlows: { userSrp: true },
     });
 
     // ========== Managed Login Branding ==========
-    new cognito.CfnManagedLoginBranding(this, "ManagedLoginBranding", {
+    new cognito.CfnManagedLoginBranding(this, "PkceManagedLoginBranding", {
       userPoolId: userPool.userPoolId,
-      clientId: appClient.userPoolClientId,
+      clientId: pkceClient.userPoolClientId,
       useCognitoProvidedValues: true,
     });
 
-    // ========== Secrets Manager ==========
-    const oauthSecret = new secretsmanager.Secret(this, "MemoryOAuthSecret", {
-      secretName: "claude-memory-cloud/oauth-secret",
-      generateSecretString: {
-        secretStringTemplate: JSON.stringify({
-          cognitoClientId: appClient.userPoolClientId,
+    // ========== S3 Vector Bucket + Index ==========
+    const vectorBucket = new s3vectors.CfnVectorBucket(this, "VectorBucket", {
+      vectorBucketName: `memory-cloud-vectors-${this.account}`,
+    });
+
+    const vectorIndex = new s3vectors.CfnIndex(this, "VectorIndex", {
+      vectorBucketName: vectorBucket.vectorBucketName!,
+      indexName: "transcript-embeddings-v2",
+      dataType: "float32",
+      dimension: 1024,
+      distanceMetric: "cosine",
+      metadataConfiguration: {
+        nonFilterableMetadataKeys: [
+          "AMAZON_BEDROCK_TEXT",
+          "AMAZON_BEDROCK_METADATA",
+        ],
+      },
+    });
+    vectorIndex.addDependency(vectorBucket);
+
+    // ========== Bedrock Knowledge Base ==========
+    const kbRole = new iam.Role(this, "KbRole", {
+      assumedBy: new iam.ServicePrincipal("bedrock.amazonaws.com"),
+      inlinePolicies: {
+        s3Read: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ["s3:GetObject", "s3:ListBucket"],
+              resources: [
+                transcriptBucket.bucketArn,
+                `${transcriptBucket.bucketArn}/*`,
+              ],
+            }),
+          ],
         }),
-        generateStringKey: "serverSecret",
-        excludePunctuation: true,
-        passwordLength: 64,
+        s3Vectors: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ["s3vectors:*"],
+              resources: [
+                vectorBucket.attrVectorBucketArn,
+                `${vectorBucket.attrVectorBucketArn}/*`,
+              ],
+            }),
+          ],
+        }),
+        bedrockInvoke: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ["bedrock:InvokeModel"],
+              resources: [
+                `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
+              ],
+            }),
+          ],
+        }),
       },
     });
 
-    // ========== Lambda Security Group ==========
-    const lambdaSg = new ec2.SecurityGroup(this, "LambdaSg", {
-      vpc,
-      description: "Lambda security group",
+    const kb = new bedrock.CfnKnowledgeBase(this, "MemoryKb", {
+      name: "memory-cloud-kb-v2",
+      roleArn: kbRole.roleArn,
+      knowledgeBaseConfiguration: {
+        type: "VECTOR",
+        vectorKnowledgeBaseConfiguration: {
+          embeddingModelArn: `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
+        },
+      },
+      storageConfiguration: {
+        type: "S3_VECTORS",
+        s3VectorsConfiguration: {
+          vectorBucketArn: vectorBucket.attrVectorBucketArn,
+          indexArn: vectorIndex.attrIndexArn,
+        },
+      },
+    });
+    kb.node.addDependency(kbRole);
+
+    new bedrock.CfnDataSource(this, "TranscriptDataSource", {
+      knowledgeBaseId: kb.attrKnowledgeBaseId,
+      name: "transcript-s3",
+      dataSourceConfiguration: {
+        type: "S3",
+        s3Configuration: { bucketArn: transcriptBucket.bucketArn },
+      },
     });
 
-    auroraSg.addIngressRule(
-      lambdaSg,
-      ec2.Port.tcp(5432),
-      "Allow Lambda to Aurora"
-    );
-
-    // ========== Shared environment ==========
-    const oauthEnv = {
-      COGNITO_USER_POOL_ID: userPool.userPoolId,
-      COGNITO_CLIENT_ID: appClient.userPoolClientId,
-      COGNITO_DOMAIN: `${cognitoDomain.domainName}.auth.${this.region}.amazoncognito.com`,
-      API_URL: httpApi.apiEndpoint,
-      SECRET_ARN: oauthSecret.secretArn,
-      REGION: this.region,
-    };
-
-    const dbEnv = {
-      DB_SECRET_ARN: auroraCluster.secret!.secretArn,
-      DB_CLUSTER_ENDPOINT: auroraCluster.clusterEndpoint.hostname,
-      DB_NAME: "memory",
-    };
-
-    // ========== OAuth Metadata Lambda ==========
-    const oauthMetadataFn = new lambda.Function(this, "OAuthMetadataFn", {
+    // ========== API Lambda ==========
+    const apiFn = new lambda.Function(this, "ApiFn", {
       runtime: lambda.Runtime.PROVIDED_AL2023,
       architecture: lambda.Architecture.ARM_64,
       handler: "bootstrap",
       code: lambda.Code.fromAsset(
-        path.join(__dirname, "../../target/lambda/oauth-metadata")
+        path.join(__dirname, "../../target/lambda/api"),
       ),
       environment: {
-        API_URL: httpApi.apiEndpoint,
-        RUST_LOG: "info",
-      },
-      timeout: cdk.Duration.seconds(10),
-      memorySize: 128,
-    });
-
-    // ========== OAuth Proxy Lambda ==========
-    const oauthProxyFn = new lambda.Function(this, "OAuthProxyFn", {
-      runtime: lambda.Runtime.PROVIDED_AL2023,
-      architecture: lambda.Architecture.ARM_64,
-      handler: "bootstrap",
-      code: lambda.Code.fromAsset(
-        path.join(__dirname, "../../target/lambda/oauth-proxy")
-      ),
-      environment: {
-        ...oauthEnv,
+        COGNITO_DOMAIN: `${cognitoDomain.domainName}.auth.${this.region}.amazoncognito.com`,
+        COGNITO_CLIENT_ID: pkceClient.userPoolClientId,
+        TRANSCRIPT_BUCKET: transcriptBucket.bucketName,
+        KB_ID: kb.attrKnowledgeBaseId,
         RUST_LOG: "info",
       },
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
     });
 
-    oauthSecret.grantRead(oauthProxyFn);
-    userPool.grant(oauthProxyFn, "cognito-idp:DescribeUserPoolClient");
-
-    // ========== API Lambda (CRUD + search) ==========
-    const apiFn = new lambda.Function(this, "ApiFn", {
-      runtime: lambda.Runtime.PROVIDED_AL2023,
-      architecture: lambda.Architecture.ARM_64,
-      handler: "bootstrap",
-      code: lambda.Code.fromAsset(
-        path.join(__dirname, "../../target/lambda/api")
-      ),
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [lambdaSg],
-      environment: {
-        ...dbEnv,
-        TRANSCRIPT_BUCKET: transcriptBucket.bucketName,
-        RUST_LOG: "info",
-      },
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 512,
-    });
-
-    auroraCluster.secret!.grantRead(apiFn);
     transcriptBucket.grantReadWrite(apiFn);
     apiFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["bedrock:InvokeModel"],
-        resources: [
-          `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
-        ],
-      })
+        actions: ["bedrock:Retrieve"],
+        resources: [kb.attrKnowledgeBaseArn],
+      }),
     );
 
-    // ========== MCP Server Lambda ==========
-    const mcpServerFn = new lambda.Function(this, "McpServerFn", {
-      runtime: lambda.Runtime.PROVIDED_AL2023,
-      architecture: lambda.Architecture.ARM_64,
-      handler: "bootstrap",
-      code: lambda.Code.fromAsset(
-        path.join(__dirname, "../../target/lambda/mcp-server")
-      ),
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [lambdaSg],
-      environment: {
-        ...dbEnv,
-        TRANSCRIPT_BUCKET: transcriptBucket.bucketName,
-        RUST_LOG: "info",
-      },
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 512,
-    });
-
-    auroraCluster.secret!.grantRead(mcpServerFn);
-    transcriptBucket.grantRead(mcpServerFn);
-    mcpServerFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["bedrock:InvokeModel"],
-        resources: [
-          `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
-        ],
-      })
+    // ========== Cognito Authorizer ==========
+    const authorizer = new apigwv2authorizers.HttpUserPoolAuthorizer(
+      "CognitoAuthorizer",
+      userPool,
+      { userPoolClients: [pkceClient] },
     );
 
-    // ========== JWT Authorizer ==========
-    const jwtAuthorizer = new apigwv2authorizers.HttpJwtAuthorizer(
-      "CognitoJwtAuthorizer",
-      `https://cognito-idp.${this.region}.amazonaws.com/${userPool.userPoolId}`,
-      {
-        jwtAudience: [appClient.userPoolClientId],
-      }
-    );
-
-    // ========== API Gateway Integrations ==========
-    const metadataIntegration =
-      new apigwv2integrations.HttpLambdaIntegration(
-        "MetadataIntegration",
-        oauthMetadataFn
-      );
-
-    const proxyIntegration = new apigwv2integrations.HttpLambdaIntegration(
-      "ProxyIntegration",
-      oauthProxyFn
-    );
-
+    // ========== API Gateway Integrations & Routes ==========
     const apiIntegration = new apigwv2integrations.HttpLambdaIntegration(
       "ApiIntegration",
-      apiFn
+      apiFn,
     );
 
-    const mcpIntegration = new apigwv2integrations.HttpLambdaIntegration(
-      "McpIntegration",
-      mcpServerFn
-    );
-
-    // ========== API Gateway Routes ==========
-
-    // OAuth Metadata (unauthenticated)
+    // /config — unauthenticated
     httpApi.addRoutes({
-      path: "/.well-known/{proxy+}",
+      path: "/config",
       methods: [apigwv2.HttpMethod.GET],
-      integration: metadataIntegration,
-    });
-
-    // OAuth Proxy (unauthenticated)
-    httpApi.addRoutes({
-      path: "/register",
-      methods: [apigwv2.HttpMethod.POST],
-      integration: proxyIntegration,
-    });
-    httpApi.addRoutes({
-      path: "/authorize",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: proxyIntegration,
-    });
-    httpApi.addRoutes({
-      path: "/callback",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: proxyIntegration,
-    });
-    httpApi.addRoutes({
-      path: "/token",
-      methods: [apigwv2.HttpMethod.POST],
-      integration: proxyIntegration,
-    });
-
-    // API (authenticated)
-    httpApi.addRoutes({
-      path: "/api/{proxy+}",
-      methods: [
-        apigwv2.HttpMethod.GET,
-        apigwv2.HttpMethod.POST,
-        apigwv2.HttpMethod.PUT,
-        apigwv2.HttpMethod.DELETE,
-      ],
       integration: apiIntegration,
-      authorizer: jwtAuthorizer,
     });
 
-    // MCP Server (authenticated)
+    // /transcript — authenticated
     httpApi.addRoutes({
-      path: "/mcp",
-      methods: [
-        apigwv2.HttpMethod.POST,
-        apigwv2.HttpMethod.GET,
-        apigwv2.HttpMethod.DELETE,
-      ],
-      integration: mcpIntegration,
-      authorizer: jwtAuthorizer,
+      path: "/transcript",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+      authorizer,
+    });
+    httpApi.addRoutes({
+      path: "/transcript/{user_id}/{sid}",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.DELETE],
+      integration: apiIntegration,
+      authorizer,
+    });
+
+    // /sessions — authenticated
+    httpApi.addRoutes({
+      path: "/sessions",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: apiIntegration,
+      authorizer,
+    });
+
+    // /recall — authenticated
+    httpApi.addRoutes({
+      path: "/recall",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+      authorizer,
     });
 
     // ========== Outputs ==========
     new cdk.CfnOutput(this, "ApiUrl", {
       value: httpApi.apiEndpoint,
-      description: "API Gateway endpoint URL",
     });
     new cdk.CfnOutput(this, "UserPoolId", {
       value: userPool.userPoolId,
-      description: "Cognito User Pool ID",
     });
     new cdk.CfnOutput(this, "CognitoDomain", {
       value: `https://${cognitoDomain.domainName}.auth.${this.region}.amazoncognito.com`,
-      description: "Cognito Hosted UI domain",
     });
     new cdk.CfnOutput(this, "ClientId", {
-      value: appClient.userPoolClientId,
-      description: "Cognito App Client ID (proxy)",
+      value: pkceClient.userPoolClientId,
     });
-    new cdk.CfnOutput(this, "AuroraClusterEndpoint", {
-      value: auroraCluster.clusterEndpoint.hostname,
-      description: "Aurora cluster endpoint",
+    new cdk.CfnOutput(this, "KnowledgeBaseId", {
+      value: kb.attrKnowledgeBaseId,
     });
     new cdk.CfnOutput(this, "TranscriptBucketName", {
       value: transcriptBucket.bucketName,
-      description: "S3 bucket for transcripts",
     });
   }
 }

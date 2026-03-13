@@ -1,0 +1,23 @@
+[package]
+name = "memory-cloud"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "memory-cloud"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
+toml = "0.8"
+dirs = "6"
+sha2.workspace = true
+base64.workspace = true
+rand = "0.9"
+tiny_http = "0.12"
+open = "5"
