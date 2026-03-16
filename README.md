@@ -1,10 +1,12 @@
 # claude-memory-cloud
 
-チームの Claude Code 会話をクラウドに保存し、セマンティック検索で再利用する。
+Claude Code の会話をクラウドに保存し、セマンティック検索で再利用する。
 
 ## アーキテクチャ
 
 ```
+Claude Code
+  ↓ Stop hook (transcript 自動アップロード)
 CLI (memory-cloud)
   ↓ PKCE auth + JWT
 API Gateway HTTP API
@@ -17,33 +19,44 @@ Lambda (Axum)
 
 VPC なし。DB なし。Lambda 1 つ。
 
-## セットアップ
+## クイックスタート
 
-### デプロイ
+### 1. プラグインインストール
 
-```bash
-# CDK
-cd cdk && npm install
-npx cdk deploy
-
-# API Lambda ビルド
-cargo lambda build --release --arm64
+```
+/plugin marketplace add masuibass/claude-memory-cloud
+/plugin install memory-cloud@claude-memory-cloud
 ```
 
-### CLI インストール
+### 2. CLI インストール
 
-[GitHub Releases](https://github.com/masuibass/claude-memory-cloud/releases) からバイナリをダウンロード、または：
-
-```bash
-cargo install --path crates/cli
-```
-
-### CLI 初期設定
+[GitHub Releases](https://github.com/masuibass/claude-memory-cloud/releases) からバイナリをダウンロード：
 
 ```bash
-memory-cloud init <API_URL>   # /config から Cognito 情報を取得
-memory-cloud login             # ブラウザで Cognito 認証 (PKCE)
+tar xzf memory-cloud-<arch>.tar.gz
+mv memory-cloud ~/.local/bin/
 ```
+
+### 3. CLI 初期設定
+
+```bash
+memory-cloud init <API_URL>
+memory-cloud login
+```
+
+### 4. 動作確認
+
+```bash
+memory-cloud recall "S3 presigned URL"
+```
+
+## プラグイン
+
+Claude Code プラグインとして以下を提供：
+
+- **Stop hook** — セッション終了時に transcript を自動アップロード
+- **`/memory-cloud:recall`** — 過去の会話をセマンティック検索
+- **`/memory-cloud:transcript`** — transcript の手動アップロード・ダウンロード
 
 ## CLI コマンド
 
@@ -55,6 +68,22 @@ memory-cloud login             # ブラウザで Cognito 認証 (PKCE)
 | `memory-cloud transcript put <file>` | transcript アップロード |
 | `memory-cloud transcript get <sid>` | transcript ダウンロード |
 | `memory-cloud sessions list` | セッション一覧 |
+
+## 自分の環境にデプロイ
+
+### 前提条件
+
+- AWS アカウント
+- Node.js, Rust, [cargo-lambda](https://www.cargo-lambda.info/)
+
+### デプロイ
+
+```bash
+cargo lambda build --release --arm64
+cd cdk && npm install && npx cdk deploy
+```
+
+デプロイ後、出力される API URL を `memory-cloud init` に渡す。
 
 ## API エンドポイント
 
@@ -77,10 +106,3 @@ memory-cloud login             # ブラウザで Cognito 認証 (PKCE)
 | S3 | transcript 保存 |
 | S3 Vectors | embedding 格納 |
 | Bedrock Knowledge Base | 自動 embedding + Retrieve API |
-
-## Crate 構成
-
-| Crate | 役割 |
-|-------|------|
-| `api` | API Lambda |
-| `cli` | CLI バイナリ (`memory-cloud`) |
