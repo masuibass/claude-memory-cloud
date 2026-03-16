@@ -1,0 +1,15 @@
+{
+  "description": "memory-cloud hooks: session stop で transcript を自動アップロード",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/stop.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

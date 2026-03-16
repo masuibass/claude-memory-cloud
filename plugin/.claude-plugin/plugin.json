@@ -1,0 +1,7 @@
+{
+  "name": "memory-cloud",
+  "description": "Claude Code の会話をクラウドに保存し、セマンティック検索で再利用する",
+  "author": {
+    "name": "masuibass"
+  }
+}
