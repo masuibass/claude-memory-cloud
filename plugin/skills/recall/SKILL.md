@@ -21,6 +21,9 @@ memory-cloud recall "<query>"
 パラメータ:
 - `query` — 検索クエリ（必須）
 
+レスポンスには `session_id`, `score`, `text` に加えて `metadata` (`project`, `created_at` 等) が含まれます。
+`metadata.project` と `session_id` を使って `/transcript get` で全文を取得できます。
+
 ## 例
 
 - `/recall CDKデプロイでエラー` — デプロイ関連の過去の会話を検索
