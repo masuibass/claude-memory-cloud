@@ -36,6 +36,11 @@ enum Command {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Share management
+    Shares {
+        #[command(subcommand)]
+        action: SharesAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -61,6 +66,22 @@ enum SessionsAction {
     List,
 }
 
+#[derive(Subcommand)]
+enum SharesAction {
+    /// Share your transcripts with another user
+    Add {
+        /// Recipient's user ID (Cognito sub)
+        recipient_id: String,
+    },
+    /// Revoke a share from another user
+    Remove {
+        /// Owner's user ID whose share to revoke
+        owner_id: String,
+    },
+    /// List shares
+    List,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -74,6 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Sessions { action } => match action {
             SessionsAction::List => cmd_sessions_list().await,
+        },
+        Command::Shares { action } => match action {
+            SharesAction::Add { recipient_id } => cmd_shares_add(&recipient_id).await,
+            SharesAction::Remove { owner_id } => cmd_shares_remove(&owner_id).await,
+            SharesAction::List => cmd_shares_list().await,
         },
     }
 }
@@ -397,4 +423,104 @@ fn format_size(bytes: i64) -> String {
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+// ---------- shares add ----------
+
+async fn cmd_shares_add(recipient_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/shares", cfg.api_url);
+    let body = serde_json::json!({ "recipient_id": recipient_id });
+
+    let resp = authed_request(&client, |token| {
+        client.post(&url).bearer_auth(token).json(&body)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    println!("Shared your transcripts with {recipient_id}");
+    Ok(())
+}
+
+// ---------- shares remove ----------
+
+async fn cmd_shares_remove(owner_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/shares/{}", cfg.api_url, owner_id);
+
+    let resp = authed_request(&client, |token| {
+        client.delete(&url).bearer_auth(token)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    println!("Removed share from {owner_id}");
+    Ok(())
+}
+
+// ---------- shares list ----------
+
+async fn cmd_shares_list() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/shares", cfg.api_url);
+
+    let resp = authed_request(&client, |token| {
+        client.get(&url).bearer_auth(token)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+
+    let shared_with_me = body["shared_with_me"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let shared_by_me = body["shared_by_me"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if shared_with_me.is_empty() && shared_by_me.is_empty() {
+        println!("No shares found.");
+        return Ok(());
+    }
+
+    if !shared_with_me.is_empty() {
+        println!("Shared with me (I can search their transcripts):");
+        for id in &shared_with_me {
+            println!("  {id}");
+        }
+    }
+
+    if !shared_by_me.is_empty() {
+        println!("Shared by me (they can search my transcripts):");
+        for id in &shared_by_me {
+            println!("  {id}");
+        }
+    }
+
+    Ok(())
 }

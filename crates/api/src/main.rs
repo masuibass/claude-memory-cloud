@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use lambda_http::request::RequestContext;
 use lambda_http::{run, Error, RequestExt};
@@ -14,8 +14,12 @@ use serde_json::json;
 struct AppState {
     s3: aws_sdk_s3::Client,
     kb: aws_sdk_bedrockagentruntime::Client,
+    ddb: aws_sdk_dynamodb::Client,
+    cognito: aws_sdk_cognitoidentityprovider::Client,
     transcript_bucket: String,
     kb_id: String,
+    shares_table: String,
+    user_pool_id: String,
 }
 
 #[tokio::main]
@@ -30,8 +34,12 @@ async fn main() -> Result<(), Error> {
     let state = Arc::new(AppState {
         s3: aws_sdk_s3::Client::new(&config),
         kb: aws_sdk_bedrockagentruntime::Client::new(&config),
+        ddb: aws_sdk_dynamodb::Client::new(&config),
+        cognito: aws_sdk_cognitoidentityprovider::Client::new(&config),
         transcript_bucket: env::var("TRANSCRIPT_BUCKET").unwrap_or_default(),
         kb_id: env::var("KB_ID").unwrap_or_default(),
+        shares_table: env::var("SHARES_TABLE").unwrap_or_default(),
+        user_pool_id: env::var("COGNITO_USER_POOL_ID").unwrap_or_default(),
     });
 
     let app = Router::new()
@@ -43,6 +51,8 @@ async fn main() -> Result<(), Error> {
         )
         .route("/sessions", get(get_sessions))
         .route("/recall", post(post_recall))
+        .route("/shares", get(get_shares).post(post_share))
+        .route("/shares/{owner_id}", delete(delete_share))
         .with_state(state);
 
     run(app).await
@@ -71,6 +81,38 @@ fn extract_user_id(req: &Request) -> Option<String> {
             .cloned(),
         _ => None,
     }
+}
+
+/// Get the list of user_ids whose transcripts the caller can search.
+/// Returns [caller_id, shared_owner_1, shared_owner_2, ...].
+async fn get_searchable_user_ids(
+    state: &AppState,
+    caller: &str,
+) -> Result<Vec<String>, aws_sdk_dynamodb::Error> {
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    let mut ids = vec![caller.to_string()];
+
+    let result = state
+        .ddb
+        .query()
+        .table_name(&state.shares_table)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(caller.to_string()))
+        .expression_attribute_values(":prefix", AttributeValue::S("share#".to_string()))
+        .consistent_read(true)
+        .send()
+        .await?;
+
+    if let Some(items) = result.items {
+        for item in &items {
+            if let Some(AttributeValue::S(owner)) = item.get("owner_id") {
+                ids.push(owner.clone());
+            }
+        }
+    }
+
+    Ok(ids)
 }
 
 // ---------- POST /transcript ----------
@@ -293,27 +335,57 @@ async fn post_recall(
     State(state): State<Arc<AppState>>,
     req: Request,
 ) -> impl IntoResponse {
-    if extract_user_id(&req).is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        );
-    }
+    let caller = match extract_user_id(&req) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
+            );
+        }
+    };
 
     let body: RecallReq = match axum::Json::from_request(req, &()).await {
         Ok(Json(b)) => b,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
     };
 
-    use aws_sdk_bedrockagentruntime::types::{
-        KnowledgeBaseQuery, KnowledgeBaseRetrievalConfiguration,
-        KnowledgeBaseVectorSearchConfiguration,
+    // Get searchable user_ids (caller + shared owners)
+    let user_ids = match get_searchable_user_ids(&state, &caller).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("ddb query error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to query shares"})),
+            );
+        }
     };
+
+    use aws_sdk_bedrockagentruntime::types::{
+        FilterAttribute, KnowledgeBaseQuery, KnowledgeBaseRetrievalConfiguration,
+        KnowledgeBaseVectorSearchConfiguration, RetrievalFilter,
+    };
+
+    // Build user_id IN [...] filter
+    let user_id_values: Vec<aws_smithy_types::Document> = user_ids
+        .iter()
+        .map(|id| aws_smithy_types::Document::String(id.clone()))
+        .collect();
+
+    let filter = RetrievalFilter::In(
+        FilterAttribute::builder()
+            .key("user_id")
+            .value(aws_smithy_types::Document::Array(user_id_values))
+            .build()
+            .expect("valid filter"),
+    );
 
     let search_config = KnowledgeBaseRetrievalConfiguration::builder()
         .vector_search_configuration(
             KnowledgeBaseVectorSearchConfiguration::builder()
                 .number_of_results(body.top_k)
+                .filter(filter)
                 .build(),
         )
         .build();
@@ -371,6 +443,184 @@ async fn post_recall(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "retrieval failed"})),
             )
+        }
+    }
+}
+
+// ---------- POST /shares ----------
+
+#[derive(Deserialize)]
+struct PostShareReq {
+    /// The user_id (Cognito sub) to share your transcripts with.
+    recipient_id: String,
+}
+
+async fn post_share(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> impl IntoResponse {
+    let caller = match extract_user_id(&req) {
+        Some(id) => id,
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))),
+    };
+
+    let body: PostShareReq = match axum::Json::from_request(req, &()).await {
+        Ok(Json(b)) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+    };
+
+    if body.recipient_id == caller {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "cannot share with yourself"})),
+        );
+    }
+
+    // Verify recipient exists in Cognito
+    match state
+        .cognito
+        .admin_get_user()
+        .user_pool_id(&state.user_pool_id)
+        .username(&body.recipient_id)
+        .send()
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "recipient user not found"})),
+            );
+        }
+    }
+
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    // Put share record: PK=recipient, SK=share#owner
+    if let Err(e) = state
+        .ddb
+        .put_item()
+        .table_name(&state.shares_table)
+        .item("pk", AttributeValue::S(body.recipient_id.clone()))
+        .item("sk", AttributeValue::S(format!("share#{}", caller)))
+        .item("owner_id", AttributeValue::S(caller.clone()))
+        .item("recipient_id", AttributeValue::S(body.recipient_id.clone()))
+        .send()
+        .await
+    {
+        tracing::error!("ddb put error: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to create share"})),
+        );
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "owner_id": caller,
+            "recipient_id": body.recipient_id,
+        })),
+    )
+}
+
+// ---------- GET /shares ----------
+
+async fn get_shares(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> impl IntoResponse {
+    let caller = match extract_user_id(&req) {
+        Some(id) => id,
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))),
+    };
+
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    // 1. Shares I receive (who shared with me)
+    let received = state
+        .ddb
+        .query()
+        .table_name(&state.shares_table)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(caller.clone()))
+        .expression_attribute_values(":prefix", AttributeValue::S("share#".to_string()))
+        .consistent_read(true)
+        .send()
+        .await;
+
+    let shared_with_me: Vec<String> = received
+        .ok()
+        .and_then(|r| r.items)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            item.get("owner_id")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.clone())
+        })
+        .collect();
+
+    // 2. Shares I gave (who I shared with) — via GSI
+    let given = state
+        .ddb
+        .query()
+        .table_name(&state.shares_table)
+        .index_name("ByOwner")
+        .key_condition_expression("owner_id = :owner")
+        .expression_attribute_values(":owner", AttributeValue::S(caller.clone()))
+        .send()
+        .await;
+
+    let shared_by_me: Vec<String> = given
+        .ok()
+        .and_then(|r| r.items)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            item.get("recipient_id")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.clone())
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "shared_with_me": shared_with_me,
+            "shared_by_me": shared_by_me,
+        })),
+    )
+}
+
+// ---------- DELETE /shares/{owner_id} ----------
+
+async fn delete_share(
+    State(state): State<Arc<AppState>>,
+    Path(owner_id): Path<String>,
+    req: Request,
+) -> impl IntoResponse {
+    let caller = match extract_user_id(&req) {
+        Some(id) => id,
+        None => return StatusCode::UNAUTHORIZED,
+    };
+
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    // Caller is the recipient — remove the share from owner_id
+    match state
+        .ddb
+        .delete_item()
+        .table_name(&state.shares_table)
+        .key("pk", AttributeValue::S(caller))
+        .key("sk", AttributeValue::S(format!("share#{}", owner_id)))
+        .send()
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("ddb delete error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }

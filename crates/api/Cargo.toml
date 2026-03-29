@@ -13,4 +13,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-bedrockagentruntime = "1"
+aws-sdk-dynamodb = "1"
+aws-sdk-cognitoidentityprovider.workspace = true
 aws-config.workspace = true
+aws-smithy-types = "1"

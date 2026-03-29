@@ -8,6 +8,7 @@ import * as apigwv2authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3vectors from "aws-cdk-lib/aws-s3vectors";
 import * as bedrock from "aws-cdk-lib/aws-bedrock";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as s3n from "aws-cdk-lib/aws-s3-notifications";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
@@ -233,6 +234,21 @@ export class ClaudeMemoryStack extends cdk.Stack {
       },
     });
 
+    // ========== DynamoDB (shares) ==========
+    const sharesTable = new dynamodb.Table(this, "SharesTable", {
+      tableName: "memory-cloud-shares",
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    sharesTable.addGlobalSecondaryIndex({
+      indexName: "ByOwner",
+      partitionKey: { name: "owner_id", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+    });
+
     // ========== API Lambda ==========
     const apiFn = new lambda.Function(this, "ApiFn", {
       runtime: lambda.Runtime.PROVIDED_AL2023,
@@ -244,8 +260,10 @@ export class ClaudeMemoryStack extends cdk.Stack {
       environment: {
         COGNITO_DOMAIN: `${cognitoDomain.domainName}.auth.${this.region}.amazoncognito.com`,
         COGNITO_CLIENT_ID: pkceClient.userPoolClientId,
+        COGNITO_USER_POOL_ID: userPool.userPoolId,
         TRANSCRIPT_BUCKET: rawBucket.bucketName,
         KB_ID: kb.attrKnowledgeBaseId,
+        SHARES_TABLE: sharesTable.tableName,
         RUST_LOG: "info",
       },
       timeout: cdk.Duration.seconds(30),
@@ -253,10 +271,17 @@ export class ClaudeMemoryStack extends cdk.Stack {
     });
 
     rawBucket.grantReadWrite(apiFn);
+    sharesTable.grantReadWriteData(apiFn);
     apiFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:Retrieve"],
         resources: [kb.attrKnowledgeBaseArn],
+      }),
+    );
+    apiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["cognito-idp:AdminGetUser"],
+        resources: [userPool.userPoolArn],
       }),
     );
 
@@ -306,6 +331,20 @@ export class ClaudeMemoryStack extends cdk.Stack {
     httpApi.addRoutes({
       path: "/recall",
       methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+      authorizer,
+    });
+
+    // /shares — authenticated
+    httpApi.addRoutes({
+      path: "/shares",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+      authorizer,
+    });
+    httpApi.addRoutes({
+      path: "/shares/{owner_id}",
+      methods: [apigwv2.HttpMethod.DELETE],
       integration: apiIntegration,
       authorizer,
     });
