@@ -18,6 +18,8 @@ enum Command {
     },
     /// Authenticate via Cognito (PKCE flow)
     Login,
+    /// Remove stored tokens
+    Logout,
     /// Semantic search across all transcripts
     Recall {
         /// Search query
@@ -102,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Init { api_url } => cmd_init(&api_url).await,
         Command::Login => cmd_login().await,
+        Command::Logout => cmd_logout(),
         Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
@@ -164,6 +167,19 @@ async fn cmd_init(api_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Cognito: {cognito_domain}");
     println!("  Client ID: {client_id}");
     println!("\nRun `memory-cloud login` to authenticate.");
+    Ok(())
+}
+
+// ---------- logout ----------
+
+fn cmd_logout() -> Result<(), Box<dyn std::error::Error>> {
+    let tokens_path = config::tokens_path();
+    if tokens_path.exists() {
+        std::fs::remove_file(&tokens_path)?;
+        println!("Logged out.");
+    } else {
+        println!("Not logged in.");
+    }
     Ok(())
 }
 

@@ -31,6 +31,12 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(cfg)
 }
 
+pub fn tokens_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("memory-cloud/tokens.json")
+}
+
 pub fn save_tokens(tokens: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
     let path = config_dir()?.join("tokens.json");
     let content = serde_json::to_string_pretty(tokens)?;
