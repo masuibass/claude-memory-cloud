@@ -227,7 +227,7 @@ export class ClaudeMemoryStack extends cdk.Stack {
     // KB DataSource now points to parsed bucket
     const dataSource = new bedrock.CfnDataSource(this, "TranscriptDataSource", {
       knowledgeBaseId: kb.attrKnowledgeBaseId,
-      name: "transcript-s3",
+      name: "transcript-parsed-s3",
       dataSourceConfiguration: {
         type: "S3",
         s3Configuration: { bucketArn: parsedBucket.bucketArn },
