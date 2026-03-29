@@ -329,6 +329,7 @@ exports.handler = async (event) => {
         COGNITO_CLIENT_ID: pkceClient.userPoolClientId,
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         TRANSCRIPT_BUCKET: rawBucket.bucketName,
+        PARSED_BUCKET: parsedBucket.bucketName,
         KB_ID: kb.attrKnowledgeBaseId,
         SHARES_TABLE: sharesTable.tableName,
         RUST_LOG: "info",
@@ -338,6 +339,7 @@ exports.handler = async (event) => {
     });
 
     rawBucket.grantReadWrite(apiFn);
+    parsedBucket.grantRead(apiFn);
     sharesTable.grantReadWriteData(apiFn);
     apiFn.addToRolePolicy(
       new iam.PolicyStatement({

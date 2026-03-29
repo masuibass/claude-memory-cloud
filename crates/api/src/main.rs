@@ -17,6 +17,7 @@ struct AppState {
     ddb: aws_sdk_dynamodb::Client,
     cognito: aws_sdk_cognitoidentityprovider::Client,
     transcript_bucket: String,
+    parsed_bucket: String,
     kb_id: String,
     shares_table: String,
     user_pool_id: String,
@@ -37,6 +38,7 @@ async fn main() -> Result<(), Error> {
         ddb: aws_sdk_dynamodb::Client::new(&config),
         cognito: aws_sdk_cognitoidentityprovider::Client::new(&config),
         transcript_bucket: env::var("TRANSCRIPT_BUCKET").unwrap_or_default(),
+        parsed_bucket: env::var("PARSED_BUCKET").unwrap_or_default(),
         kb_id: env::var("KB_ID").unwrap_or_default(),
         shares_table: env::var("SHARES_TABLE").unwrap_or_default(),
         user_pool_id: env::var("COGNITO_USER_POOL_ID").unwrap_or_default(),
@@ -167,11 +169,17 @@ async fn post_transcript(
     }
 }
 
+#[derive(Deserialize)]
+struct TranscriptGetQuery {
+    raw: Option<bool>,
+}
+
 // ---------- GET /transcript/{user_id}/{project}/{sid} ----------
 
 async fn get_transcript(
     State(state): State<Arc<AppState>>,
     Path((user_id, project, sid)): Path<(String, String, String)>,
+    Query(query): Query<TranscriptGetQuery>,
     req: Request,
 ) -> impl IntoResponse {
     let caller = match extract_user_id(&req) {
@@ -183,7 +191,11 @@ async fn get_transcript(
         return (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"})));
     }
 
-    let key = format!("{}/{}/{}.jsonl", user_id, project, sid);
+    let (bucket, key) = if query.raw.unwrap_or(false) {
+        (&state.transcript_bucket, format!("{}/{}/{}.jsonl", user_id, project, sid))
+    } else {
+        (&state.parsed_bucket, format!("{}/{}/{}.md", user_id, project, sid))
+    };
 
     let presigned_config = aws_sdk_s3::presigning::PresigningConfig::builder()
         .expires_in(std::time::Duration::from_secs(3600))
@@ -193,7 +205,7 @@ async fn get_transcript(
     match state
         .s3
         .get_object()
-        .bucket(&state.transcript_bucket)
+        .bucket(bucket)
         .key(&key)
         .presigned(presigned_config)
         .await
@@ -428,10 +440,27 @@ async fn post_recall(
                         .or_else(|| filename.strip_suffix(".jsonl"))
                         .or_else(|| filename.strip_suffix(".txt"))
                         .unwrap_or(filename);
+                    let metadata: serde_json::Map<String, serde_json::Value> = r
+                        .metadata()
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| {
+                                    let val = match v {
+                                        aws_smithy_types::Document::String(s) => json!(s),
+                                        aws_smithy_types::Document::Number(n) => json!(n.to_f64_lossy()),
+                                        aws_smithy_types::Document::Bool(b) => json!(b),
+                                        other => json!(format!("{other:?}")),
+                                    };
+                                    (k.clone(), val)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     json!({
                         "session_id": session_id,
                         "score": score,
                         "text": text,
+                        "metadata": metadata,
                     })
                 })
                 .collect();
