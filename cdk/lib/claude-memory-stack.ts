@@ -232,6 +232,16 @@ export class ClaudeMemoryStack extends cdk.Stack {
         type: "S3",
         s3Configuration: { bucketArn: parsedBucket.bucketArn },
       },
+      vectorIngestionConfiguration: {
+        chunkingConfiguration: {
+          chunkingStrategy: "SEMANTIC",
+          semanticChunkingConfiguration: {
+            maxTokens: 512,
+            bufferSize: 0,
+            breakpointPercentileThreshold: 90,
+          },
+        },
+      },
     });
 
     // ========== KB Sync Lambda (parsed S3 → start ingestion) ==========
