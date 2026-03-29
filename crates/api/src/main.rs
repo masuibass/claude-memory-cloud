@@ -38,7 +38,7 @@ async fn main() -> Result<(), Error> {
         .route("/config", get(get_config))
         .route("/transcript", post(post_transcript))
         .route(
-            "/transcript/{user_id}/{sid}",
+            "/transcript/{user_id}/{project}/{sid}",
             get(get_transcript).delete(delete_transcript),
         )
         .route("/sessions", get(get_sessions))
@@ -78,6 +78,7 @@ fn extract_user_id(req: &Request) -> Option<String> {
 #[derive(Deserialize)]
 struct PostTranscriptReq {
     session_id: String,
+    project: String,
 }
 
 async fn post_transcript(
@@ -94,7 +95,7 @@ async fn post_transcript(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
     };
 
-    let key = format!("{}/{}.txt", user_id, body.session_id);
+    let key = format!("{}/{}/{}.jsonl", user_id, body.project, body.session_id);
 
     let presigned_config = aws_sdk_s3::presigning::PresigningConfig::builder()
         .expires_in(std::time::Duration::from_secs(3600))
@@ -123,11 +124,11 @@ async fn post_transcript(
     }
 }
 
-// ---------- GET /transcript/{user_id}/{sid} ----------
+// ---------- GET /transcript/{user_id}/{project}/{sid} ----------
 
 async fn get_transcript(
     State(state): State<Arc<AppState>>,
-    Path((user_id, sid)): Path<(String, String)>,
+    Path((user_id, project, sid)): Path<(String, String, String)>,
     req: Request,
 ) -> impl IntoResponse {
     let caller = match extract_user_id(&req) {
@@ -139,7 +140,7 @@ async fn get_transcript(
         return (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"})));
     }
 
-    let key = format!("{}/{}.txt", user_id, sid);
+    let key = format!("{}/{}/{}.jsonl", user_id, project, sid);
 
     let presigned_config = aws_sdk_s3::presigning::PresigningConfig::builder()
         .expires_in(std::time::Duration::from_secs(3600))
@@ -165,11 +166,11 @@ async fn get_transcript(
     }
 }
 
-// ---------- DELETE /transcript/{user_id}/{sid} ----------
+// ---------- DELETE /transcript/{user_id}/{project}/{sid} ----------
 
 async fn delete_transcript(
     State(state): State<Arc<AppState>>,
-    Path((user_id, sid)): Path<(String, String)>,
+    Path((user_id, project, sid)): Path<(String, String, String)>,
     req: Request,
 ) -> impl IntoResponse {
     let caller = match extract_user_id(&req) {
@@ -181,7 +182,7 @@ async fn delete_transcript(
         return StatusCode::FORBIDDEN;
     }
 
-    let key = format!("{}/{}.txt", user_id, sid);
+    let key = format!("{}/{}/{}.jsonl", user_id, project, sid);
 
     match state
         .s3
@@ -243,7 +244,7 @@ async fn get_sessions(
                 .filter_map(|obj| {
                     let key = obj.key()?;
                     let filename = key.strip_prefix(&prefix)?;
-                    let session_id = filename.strip_suffix(".txt")?.to_string();
+                    let session_id = filename.strip_suffix(".jsonl")?.to_string();
                     Some(SessionEntry {
                         session_id,
                         size: obj.size().unwrap_or(0),
@@ -345,11 +346,15 @@ async fn post_recall(
                         .and_then(|l| l.s3_location())
                         .and_then(|s3| s3.uri())
                         .unwrap_or_default();
-                    let session_id = uri
+                    let filename = uri
                         .rsplit('/')
                         .next()
-                        .and_then(|f| f.strip_suffix(".txt"))
                         .unwrap_or_default();
+                    let session_id = filename
+                        .strip_suffix(".md")
+                        .or_else(|| filename.strip_suffix(".jsonl"))
+                        .or_else(|| filename.strip_suffix(".txt"))
+                        .unwrap_or(filename);
                     json!({
                         "session_id": session_id,
                         "score": score,

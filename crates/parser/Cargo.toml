@@ -1,0 +1,21 @@
+[package]
+name = "parser"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "parser"
+path = "src/main.rs"
+
+[dependencies]
+transcript.path = "../transcript"
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws_lambda_events = { version = "0.16", default-features = false, features = ["sqs", "s3"] }
+lambda_runtime = "0.13"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+urlencoding = "2"

@@ -44,6 +44,9 @@ enum TranscriptAction {
     Put {
         /// Path to the JSONL file
         file: String,
+        /// Project identifier (directory name from ~/.claude/projects/)
+        #[arg(short, long)]
+        project: Option<String>,
     },
     /// Download a transcript
     Get {
@@ -66,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Login => cmd_login().await,
         Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
         Command::Transcript { action } => match action {
-            TranscriptAction::Put { file } => cmd_transcript_put(&file).await,
+            TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
             TranscriptAction::Get { session_id } => cmd_transcript_get(&session_id).await,
         },
         Command::Sessions { action } => match action {
@@ -246,7 +249,31 @@ async fn cmd_recall(query: &str, top_k: i32) -> Result<(), Box<dyn std::error::E
 
 // ---------- transcript put ----------
 
-async fn cmd_transcript_put(file: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Derive project hash from a file path under ~/.claude/projects/{project_hash}/.
+fn derive_project_from_path(file: &str) -> Option<String> {
+    let path = std::path::Path::new(file);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let s = abs.to_str()?;
+
+    // Look for the pattern: .claude/projects/{project_hash}/
+    let marker = ".claude/projects/";
+    let idx = s.find(marker)?;
+    let after = &s[idx + marker.len()..];
+    let project_hash = after.split('/').next()?;
+    if project_hash.is_empty() {
+        return None;
+    }
+    Some(project_hash.to_string())
+}
+
+async fn cmd_transcript_put(
+    file: &str,
+    project_arg: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
     let client = reqwest::Client::new();
 
@@ -257,8 +284,14 @@ async fn cmd_transcript_put(file: &str) -> Result<(), Box<dyn std::error::Error>
         .ok_or("invalid file path")?
         .to_string();
 
+    let project = match project_arg {
+        Some(p) => p.to_string(),
+        None => derive_project_from_path(file)
+            .ok_or("cannot derive project from path; use --project")?,
+    };
+
     let url = format!("{}/transcript", cfg.api_url);
-    let body = serde_json::json!({ "session_id": session_id });
+    let body = serde_json::json!({ "session_id": session_id, "project": project });
 
     let resp = authed_request(&client, |token| {
         client.post(&url).bearer_auth(token).json(&body)

@@ -8,6 +8,9 @@ import * as apigwv2authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3vectors from "aws-cdk-lib/aws-s3vectors";
 import * as bedrock from "aws-cdk-lib/aws-bedrock";
+import * as sqs from "aws-cdk-lib/aws-sqs";
+import * as s3n from "aws-cdk-lib/aws-s3-notifications";
+import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -15,9 +18,9 @@ export class ClaudeMemoryStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // ========== S3 Bucket (transcripts) ==========
-    const transcriptBucket = new s3.Bucket(this, "TranscriptBucket", {
-      bucketName: `claude-memory-transcripts-${this.account}`,
+    // ========== S3 Bucket (raw transcripts) ==========
+    const rawBucket = new s3.Bucket(this, "RawTranscriptBucket", {
+      bucketName: `claude-memory-raw-${this.account}`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       lifecycleRules: [
@@ -31,6 +34,57 @@ export class ClaudeMemoryStack extends cdk.Stack {
         },
       ],
     });
+
+    // ========== S3 Bucket (parsed for KB) ==========
+    const parsedBucket = new s3.Bucket(this, "ParsedTranscriptBucket", {
+      bucketName: `claude-memory-parsed-${this.account}`,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+    });
+
+    // ========== SQS Queue (raw → parser) ==========
+    const dlq = new sqs.Queue(this, "ParserDLQ", {
+      queueName: "claude-memory-parser-dlq",
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
+    const parserQueue = new sqs.Queue(this, "ParserQueue", {
+      queueName: "claude-memory-parser-queue",
+      visibilityTimeout: cdk.Duration.seconds(300),
+      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+    });
+
+    rawBucket.addEventNotification(
+      s3.EventType.OBJECT_CREATED,
+      new s3n.SqsDestination(parserQueue),
+      { suffix: ".jsonl" },
+    );
+
+    // ========== Parser Lambda ==========
+    const parserFn = new lambda.Function(this, "ParserFn", {
+      runtime: lambda.Runtime.PROVIDED_AL2023,
+      architecture: lambda.Architecture.ARM_64,
+      handler: "bootstrap",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../target/lambda/parser"),
+      ),
+      environment: {
+        PARSED_BUCKET: parsedBucket.bucketName,
+        RUST_LOG: "info",
+      },
+      timeout: cdk.Duration.seconds(120),
+      memorySize: 512,
+    });
+
+    rawBucket.grantRead(parserFn);
+    parsedBucket.grantWrite(parserFn);
+
+    parserFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(parserQueue, {
+        batchSize: 5,
+        maxConcurrency: 10,
+      }),
+    );
 
     // ========== Cognito User Pool ==========
     const userPool = new cognito.UserPool(this, "MemoryUserPool", {
@@ -120,8 +174,8 @@ export class ClaudeMemoryStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ["s3:GetObject", "s3:ListBucket"],
               resources: [
-                transcriptBucket.bucketArn,
-                `${transcriptBucket.bucketArn}/*`,
+                parsedBucket.bucketArn,
+                `${parsedBucket.bucketArn}/*`,
               ],
             }),
           ],
@@ -169,12 +223,13 @@ export class ClaudeMemoryStack extends cdk.Stack {
     });
     kb.node.addDependency(kbRole);
 
+    // KB DataSource now points to parsed bucket
     new bedrock.CfnDataSource(this, "TranscriptDataSource", {
       knowledgeBaseId: kb.attrKnowledgeBaseId,
       name: "transcript-s3",
       dataSourceConfiguration: {
         type: "S3",
-        s3Configuration: { bucketArn: transcriptBucket.bucketArn },
+        s3Configuration: { bucketArn: parsedBucket.bucketArn },
       },
     });
 
@@ -189,7 +244,7 @@ export class ClaudeMemoryStack extends cdk.Stack {
       environment: {
         COGNITO_DOMAIN: `${cognitoDomain.domainName}.auth.${this.region}.amazoncognito.com`,
         COGNITO_CLIENT_ID: pkceClient.userPoolClientId,
-        TRANSCRIPT_BUCKET: transcriptBucket.bucketName,
+        TRANSCRIPT_BUCKET: rawBucket.bucketName,
         KB_ID: kb.attrKnowledgeBaseId,
         RUST_LOG: "info",
       },
@@ -197,7 +252,7 @@ export class ClaudeMemoryStack extends cdk.Stack {
       memorySize: 256,
     });
 
-    transcriptBucket.grantReadWrite(apiFn);
+    rawBucket.grantReadWrite(apiFn);
     apiFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:Retrieve"],
@@ -233,7 +288,7 @@ export class ClaudeMemoryStack extends cdk.Stack {
       authorizer,
     });
     httpApi.addRoutes({
-      path: "/transcript/{user_id}/{sid}",
+      path: "/transcript/{proxy+}",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.DELETE],
       integration: apiIntegration,
       authorizer,
@@ -271,8 +326,11 @@ export class ClaudeMemoryStack extends cdk.Stack {
     new cdk.CfnOutput(this, "KnowledgeBaseId", {
       value: kb.attrKnowledgeBaseId,
     });
-    new cdk.CfnOutput(this, "TranscriptBucketName", {
-      value: transcriptBucket.bucketName,
+    new cdk.CfnOutput(this, "RawBucketName", {
+      value: rawBucket.bucketName,
+    });
+    new cdk.CfnOutput(this, "ParsedBucketName", {
+      value: parsedBucket.bucketName,
     });
   }
 }
