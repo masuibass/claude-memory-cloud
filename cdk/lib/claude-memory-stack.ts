@@ -415,6 +415,12 @@ exports.handler = async (event) => {
       integration: apiIntegration,
       authorizer,
     });
+    httpApi.addRoutes({
+      path: "/shares/recipients/{recipient_id}",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: apiIntegration,
+      authorizer,
+    });
 
     // ========== Outputs ==========
     new cdk.CfnOutput(this, "ApiUrl", {

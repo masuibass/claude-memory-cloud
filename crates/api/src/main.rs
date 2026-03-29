@@ -53,6 +53,7 @@ async fn main() -> Result<(), Error> {
         .route("/recall", post(post_recall))
         .route("/shares", get(get_shares).post(post_share))
         .route("/shares/{owner_id}", delete(delete_share))
+        .route("/shares/recipients/{recipient_id}", delete(delete_share_by_owner))
         .with_state(state);
 
     run(app).await
@@ -614,6 +615,38 @@ async fn delete_share(
         .table_name(&state.shares_table)
         .key("pk", AttributeValue::S(caller))
         .key("sk", AttributeValue::S(format!("share#{}", owner_id)))
+        .send()
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("ddb delete error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+// ---------- DELETE /shares/recipients/{recipient_id} ----------
+
+async fn delete_share_by_owner(
+    State(state): State<Arc<AppState>>,
+    Path(recipient_id): Path<String>,
+    req: Request,
+) -> impl IntoResponse {
+    let caller = match extract_user_id(&req) {
+        Some(id) => id,
+        None => return StatusCode::UNAUTHORIZED,
+    };
+
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    // Caller is the owner — remove the share to recipient_id
+    match state
+        .ddb
+        .delete_item()
+        .table_name(&state.shares_table)
+        .key("pk", AttributeValue::S(recipient_id))
+        .key("sk", AttributeValue::S(format!("share#{}", caller)))
         .send()
         .await
     {

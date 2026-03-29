@@ -79,10 +79,15 @@ enum SharesAction {
         /// Recipient's user ID (Cognito sub)
         recipient_id: String,
     },
-    /// Revoke a share from another user
+    /// Revoke a share you received (stop seeing their transcripts)
     Remove {
         /// Owner's user ID whose share to revoke
         owner_id: String,
+    },
+    /// Revoke a share you gave (stop sharing your transcripts with them)
+    Revoke {
+        /// Recipient's user ID to revoke access from
+        recipient_id: String,
     },
     /// List shares
     List,
@@ -106,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Shares { action } => match action {
             SharesAction::Add { recipient_id } => cmd_shares_add(&recipient_id).await,
             SharesAction::Remove { owner_id } => cmd_shares_remove(&owner_id).await,
+            SharesAction::Revoke { recipient_id } => cmd_shares_revoke(&recipient_id).await,
             SharesAction::List => cmd_shares_list().await,
         },
     }
@@ -476,6 +482,29 @@ async fn cmd_shares_remove(owner_id: &str) -> Result<(), Box<dyn std::error::Err
     }
 
     println!("Removed share from {owner_id}");
+    Ok(())
+}
+
+// ---------- shares revoke ----------
+
+async fn cmd_shares_revoke(recipient_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/shares/recipients/{}", cfg.api_url, recipient_id);
+
+    let resp = authed_request(&client, |token| {
+        client.delete(&url).bearer_auth(token)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    println!("Revoked share to {recipient_id}");
     Ok(())
 }
 
