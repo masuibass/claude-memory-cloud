@@ -12,12 +12,15 @@ CLI (memory-cloud)
 API Gateway HTTP API
   ↓ Cognito JWT Authorizer
 Lambda (Axum)
-  ├── S3: transcript 保存・取得 (presigned URL)
+  ├── S3 (raw): JSONL 保存 (presigned URL)
+  ├── DynamoDB: 共有管理
   └── Bedrock KB: セマンティック検索
-        └── S3 Vectors: embedding 格納
+
+S3 (raw) → SQS → Parser Lambda → S3 (parsed) → KB Sync Lambda → Bedrock KB
+                   JSONL→Markdown       .md + .metadata.json       自動 ingestion
 ```
 
-VPC なし。DB なし。Lambda 1 つ。
+VPC なし。RDB なし。サーバーレス。
 
 ## クイックスタート
 
@@ -50,6 +53,14 @@ memory-cloud login
 memory-cloud recall "S3 presigned URL"
 ```
 
+### 5. 過去の会話を一括アップロード
+
+```bash
+memory-cloud transcript bulk-upload
+```
+
+`~/.claude/projects` 以下の全 JSONL を一括アップロードします。
+
 ## プラグイン
 
 Claude Code プラグインとして以下を提供：
@@ -67,7 +78,26 @@ Claude Code プラグインとして以下を提供：
 | `memory-cloud recall <query>` | セマンティック検索 |
 | `memory-cloud transcript put <file>` | transcript アップロード |
 | `memory-cloud transcript get <sid>` | transcript ダウンロード |
+| `memory-cloud transcript bulk-upload` | 一括アップロード |
 | `memory-cloud sessions list` | セッション一覧 |
+| `memory-cloud shares add <user_id>` | 相手にトランスクリプトを共有 |
+| `memory-cloud shares revoke <user_id>` | 共有を取り消し |
+| `memory-cloud shares remove <user_id>` | 受けた共有を解除 |
+| `memory-cloud shares list` | 共有一覧 |
+
+## 共有
+
+ユーザー間でトランスクリプトの検索権限を共有できます。
+
+```bash
+# 自分のトランスクリプトを user-B に共有
+memory-cloud shares add <user-B の Cognito sub>
+
+# 共有を取り消し
+memory-cloud shares revoke <user-B の Cognito sub>
+```
+
+`recall` 時は自分のトランスクリプト + 共有されたトランスクリプトのみが検索対象になります（`user_id IN [...]` フィルタで強制）。
 
 ## 自分の環境にデプロイ
 
@@ -79,7 +109,7 @@ Claude Code プラグインとして以下を提供：
 ### デプロイ
 
 ```bash
-cargo lambda build --release --arm64
+cargo lambda build --release --arm64 -p api -p parser
 cd cdk && npm install && npx cdk deploy
 ```
 
@@ -91,10 +121,14 @@ cd cdk && npm install && npx cdk deploy
 |---------|------|------|------|
 | GET | `/config` | なし | Cognito 情報 |
 | POST | `/transcript` | JWT | presigned URL 発行 |
-| GET | `/transcript/{uid}/{sid}` | JWT | transcript 取得 |
-| DELETE | `/transcript/{uid}/{sid}` | JWT | transcript 削除 |
+| GET | `/transcript/{uid}/{project}/{sid}` | JWT | transcript 取得 |
+| DELETE | `/transcript/{uid}/{project}/{sid}` | JWT | transcript 削除 |
 | GET | `/sessions` | JWT | セッション一覧 |
-| POST | `/recall` | JWT | KB 検索 |
+| POST | `/recall` | JWT | KB 検索 (user_id フィルタ付き) |
+| GET | `/shares` | JWT | 共有一覧 |
+| POST | `/shares` | JWT | 共有作成 |
+| DELETE | `/shares/{owner_id}` | JWT | 受けた共有を解除 |
+| DELETE | `/shares/recipients/{recipient_id}` | JWT | 共有取り消し |
 
 ## AWS リソース
 
@@ -102,7 +136,12 @@ cd cdk && npm install && npx cdk deploy
 |---------|------|
 | Cognito User Pool | PKCE 認証 |
 | API Gateway HTTP API | JWT 認証 + ルーティング |
-| Lambda | API (Axum / Rust) |
-| S3 | transcript 保存 |
+| Lambda (API) | REST API (Axum / Rust) |
+| Lambda (Parser) | JSONL → Markdown パース |
+| Lambda (KB Sync) | parsed S3 → KB ingestion 自動トリガー |
+| S3 (raw) | JSONL 保存 |
+| S3 (parsed) | Markdown + metadata.json |
 | S3 Vectors | embedding 格納 |
-| Bedrock Knowledge Base | 自動 embedding + Retrieve API |
+| SQS | raw → parser バッファリング + DLQ |
+| DynamoDB | 共有管理 |
+| Bedrock Knowledge Base | セマンティックチャンキング + Retrieve API |
