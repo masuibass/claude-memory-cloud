@@ -558,7 +558,7 @@ async fn get_shares(
         .filter_map(|item| {
             item.get("owner_id")
                 .and_then(|v| v.as_s().ok())
-                .map(|s| s.clone())
+                .cloned()
         })
         .collect();
 
@@ -581,7 +581,7 @@ async fn get_shares(
         .filter_map(|item| {
             item.get("recipient_id")
                 .and_then(|v| v.as_s().ok())
-                .map(|s| s.clone())
+                .cloned()
         })
         .collect();
 

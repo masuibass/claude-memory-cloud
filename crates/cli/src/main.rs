@@ -57,6 +57,9 @@ enum TranscriptAction {
     Get {
         /// Session ID
         session_id: String,
+        /// Project identifier
+        #[arg(short, long)]
+        project: String,
     },
     /// Bulk upload all transcripts from ~/.claude/projects
     BulkUpload {
@@ -102,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
-            TranscriptAction::Get { session_id } => cmd_transcript_get(&session_id).await,
+            TranscriptAction::Get { session_id, project } => cmd_transcript_get(&session_id, &project).await,
             TranscriptAction::BulkUpload { path } => cmd_bulk_upload(path.as_deref()).await,
         },
         Command::Sessions { action } => match action {
@@ -121,7 +124,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Make an authenticated request. On 401, refresh tokens and retry once.
 async fn authed_request(
-    client: &reqwest::Client,
     build: impl Fn(&str) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
     let token = config::load_id_token()?;
@@ -255,7 +257,7 @@ async fn cmd_recall(query: &str, top_k: i32) -> Result<(), Box<dyn std::error::E
     let url = format!("{}/recall", cfg.api_url);
     let body = serde_json::json!({ "query": query, "top_k": top_k });
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.post(&url).bearer_auth(token).json(&body)
     })
     .await?;
@@ -332,7 +334,7 @@ async fn cmd_transcript_put(
     let url = format!("{}/transcript", cfg.api_url);
     let body = serde_json::json!({ "session_id": session_id, "project": project });
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.post(&url).bearer_auth(token).json(&body)
     })
     .await?;
@@ -364,15 +366,15 @@ async fn cmd_transcript_put(
 
 // ---------- transcript get ----------
 
-async fn cmd_transcript_get(session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_transcript_get(session_id: &str, project: &str) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
     let token = config::load_id_token()?;
     let user_id = config::extract_sub_from_token(&token)?;
     let client = reqwest::Client::new();
 
-    let url = format!("{}/transcript/{}/{}", cfg.api_url, user_id, session_id);
+    let url = format!("{}/transcript/{}/{}/{}", cfg.api_url, user_id, project, session_id);
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.get(&url).bearer_auth(token)
     })
     .await?;
@@ -399,7 +401,7 @@ async fn cmd_sessions_list() -> Result<(), Box<dyn std::error::Error>> {
 
     let url = format!("{}/sessions", cfg.api_url);
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.get(&url).bearer_auth(token)
     })
     .await?;
@@ -447,7 +449,7 @@ async fn cmd_shares_add(recipient_id: &str) -> Result<(), Box<dyn std::error::Er
     let url = format!("{}/shares", cfg.api_url);
     let body = serde_json::json!({ "recipient_id": recipient_id });
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.post(&url).bearer_auth(token).json(&body)
     })
     .await?;
@@ -470,7 +472,7 @@ async fn cmd_shares_remove(owner_id: &str) -> Result<(), Box<dyn std::error::Err
 
     let url = format!("{}/shares/{}", cfg.api_url, owner_id);
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.delete(&url).bearer_auth(token)
     })
     .await?;
@@ -493,7 +495,7 @@ async fn cmd_shares_revoke(recipient_id: &str) -> Result<(), Box<dyn std::error:
 
     let url = format!("{}/shares/recipients/{}", cfg.api_url, recipient_id);
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.delete(&url).bearer_auth(token)
     })
     .await?;
@@ -516,7 +518,7 @@ async fn cmd_shares_list() -> Result<(), Box<dyn std::error::Error>> {
 
     let url = format!("{}/shares", cfg.api_url);
 
-    let resp = authed_request(&client, |token| {
+    let resp = authed_request(|token| {
         client.get(&url).bearer_auth(token)
     })
     .await?;
@@ -624,7 +626,7 @@ async fn cmd_bulk_upload(path: Option<&str>) -> Result<(), Box<dyn std::error::E
         let url = format!("{}/transcript", cfg.api_url);
         let body = serde_json::json!({ "session_id": session_id, "project": project });
 
-        let resp = match authed_request(&client, |token| {
+        let resp = match authed_request(|token| {
             client.post(&url).bearer_auth(token).json(&body)
         })
         .await
