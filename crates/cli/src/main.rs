@@ -1,4 +1,5 @@
 mod config;
+mod log;
 
 use clap::{Parser, Subcommand};
 
@@ -105,7 +106,17 @@ enum SharesAction {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    log::init();
     let cli = Cli::parse();
+    log::info(&format!("command: {:?}", std::env::args().collect::<Vec<_>>()));
+    let result = run(cli).await;
+    if let Err(ref e) = result {
+        log::error(&format!("{e}"));
+    }
+    result
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Init { api_url } => cmd_init(&api_url).await,
         Command::Login => cmd_login().await,

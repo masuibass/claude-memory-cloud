@@ -21,3 +21,4 @@ base64.workspace = true
 rand = "0.9"
 tiny_http = "0.12"
 open = "5"
+chrono.workspace = true

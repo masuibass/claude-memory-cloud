@@ -14,5 +14,5 @@ if [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
 fi
 
-# Upload transcript
+# Upload transcript (CLI logs to ~/Library/Logs/memory-cloud/cli.log)
 memory-cloud transcript put "$TRANSCRIPT_PATH" 2>/dev/null || true
