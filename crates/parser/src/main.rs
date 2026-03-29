@@ -286,7 +286,7 @@ fn render_user(md: &mut String, u: &UserLine) {
     }
 
     md.push_str("## User\n");
-    md.push_str(&text);
+    md.push_str(&escape_heading_markers(&text));
     md.push_str("\n\n");
 }
 
@@ -302,7 +302,7 @@ fn render_assistant(md: &mut String, a: &AssistantLine) {
         match block {
             ContentBlock::Text { text } => {
                 if !text.is_empty() {
-                    section.push_str(text);
+                    section.push_str(&escape_heading_markers(text));
                     section.push('\n');
                     has_content = true;
                 }
@@ -328,7 +328,7 @@ fn render_system(md: &mut String, s: &SystemLine) {
     if matches!(s.subtype, transcript::SystemSubtype::CompactBoundary) {
         if let Some(ref content) = s.content {
             md.push_str("## Summary (compacted)\n");
-            md.push_str(content);
+            md.push_str(&escape_heading_markers(content));
             md.push_str("\n\n");
         }
     }
@@ -337,6 +337,22 @@ fn render_system(md: &mut String, s: &SystemLine) {
 // ============================================================
 // Helpers
 // ============================================================
+
+/// Escape `#` at the start of lines so content doesn't create false
+/// Markdown heading boundaries that confuse semantic chunking.
+fn escape_heading_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.starts_with('#') {
+            out.push('\\');
+        }
+        out.push_str(line);
+    }
+    out
+}
 
 fn extract_user_text(content: &MessageContent) -> String {
     match content {
