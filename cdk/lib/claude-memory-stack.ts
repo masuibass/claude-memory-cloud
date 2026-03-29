@@ -225,7 +225,7 @@ export class ClaudeMemoryStack extends cdk.Stack {
     kb.node.addDependency(kbRole);
 
     // KB DataSource now points to parsed bucket
-    new bedrock.CfnDataSource(this, "TranscriptDataSource", {
+    const dataSource = new bedrock.CfnDataSource(this, "TranscriptDataSource", {
       knowledgeBaseId: kb.attrKnowledgeBaseId,
       name: "transcript-s3",
       dataSourceConfiguration: {
@@ -233,6 +233,63 @@ export class ClaudeMemoryStack extends cdk.Stack {
         s3Configuration: { bucketArn: parsedBucket.bucketArn },
       },
     });
+
+    // ========== KB Sync Lambda (parsed S3 → start ingestion) ==========
+    const syncFn = new lambda.Function(this, "KbSyncFn", {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      handler: "index.handler",
+      code: lambda.Code.fromInline(`
+const { BedrockAgentClient, StartIngestionJobCommand, ListIngestionJobsCommand } = require("@aws-sdk/client-bedrock-agent");
+const client = new BedrockAgentClient();
+exports.handler = async (event) => {
+  // Skip if an ingestion job is already running
+  const list = await client.send(new ListIngestionJobsCommand({
+    knowledgeBaseId: process.env.KB_ID,
+    dataSourceId: process.env.DATA_SOURCE_ID,
+    maxResults: 1,
+    sortBy: { attribute: "STARTED_AT", order: "DESCENDING" },
+  }));
+  const latest = list.ingestionJobSummaries?.[0];
+  if (latest && (latest.status === "STARTING" || latest.status === "IN_PROGRESS")) {
+    console.log("ingestion already running:", latest.ingestionJobId);
+    return;
+  }
+  try {
+    const res = await client.send(new StartIngestionJobCommand({
+      knowledgeBaseId: process.env.KB_ID,
+      dataSourceId: process.env.DATA_SOURCE_ID,
+    }));
+    console.log("ingestion started:", res.ingestionJob?.ingestionJobId);
+  } catch (e) {
+    if (e.name === "ConflictException") {
+      console.log("ingestion already in progress, skipping");
+    } else {
+      throw e;
+    }
+  }
+};
+      `),
+      environment: {
+        KB_ID: kb.attrKnowledgeBaseId,
+        DATA_SOURCE_ID: dataSource.attrDataSourceId,
+      },
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 128,
+    });
+
+    syncFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:StartIngestionJob", "bedrock:ListIngestionJobs"],
+        resources: [kb.attrKnowledgeBaseArn],
+      }),
+    );
+
+    parsedBucket.addEventNotification(
+      s3.EventType.OBJECT_CREATED,
+      new s3n.LambdaDestination(syncFn),
+      { suffix: ".md" },
+    );
 
     // ========== DynamoDB (shares) ==========
     const sharesTable = new dynamodb.Table(this, "SharesTable", {
