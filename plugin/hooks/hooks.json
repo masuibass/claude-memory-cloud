@@ -1,6 +1,16 @@
 {
-  "description": "memory-cloud hooks: session stop で transcript を自動アップロード",
+  "description": "memory-cloud hooks: セットアップチェック + transcript 自動アップロード",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/check-setup.sh"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

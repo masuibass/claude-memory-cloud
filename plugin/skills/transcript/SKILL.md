@@ -1,6 +1,6 @@
 ---
 name: transcript
-description: transcript のアップロード・ダウンロード
+description: transcript のアップロード・ダウンロード・一括アップロード
 user-invocable: true
 ---
 
@@ -18,15 +18,30 @@ transcript ファイルをアップロードします。
 memory-cloud transcript put <file>
 ```
 
-### `/transcript get <session_id>`
+プロジェクトはファイルパスから自動推定されます。明示指定も可能:
+
+```bash
+memory-cloud transcript put <file> --project <project_hash>
+```
+
+### `/transcript get <session_id> --project <project_hash>`
 
 transcript をダウンロードして表示します。
 
 ```bash
-memory-cloud transcript get <session_id>
+memory-cloud transcript get <session_id> --project <project_hash>
+```
+
+### `/transcript bulk-upload`
+
+`~/.claude/projects` 以下の全 JSONL を一括アップロードします。
+
+```bash
+memory-cloud transcript bulk-upload
 ```
 
 ## 備考
 
 - stop hook により、セッション終了時に自動アップロードされます
 - 手動アップロードは過去のセッションを追加したい場合に使います
+- bulk-upload は初回セットアップ時にまとめてアップロードするのに便利です
