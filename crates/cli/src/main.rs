@@ -20,6 +20,8 @@ enum Command {
     Login,
     /// Remove stored tokens
     Logout,
+    /// Remove all local config and tokens
+    Reset,
     /// Semantic search across all transcripts
     Recall {
         /// Search query
@@ -105,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Init { api_url } => cmd_init(&api_url).await,
         Command::Login => cmd_login().await,
         Command::Logout => cmd_logout(),
+        Command::Reset => cmd_reset(),
         Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
@@ -179,6 +182,19 @@ fn cmd_logout() -> Result<(), Box<dyn std::error::Error>> {
         println!("Logged out.");
     } else {
         println!("Not logged in.");
+    }
+    Ok(())
+}
+
+// ---------- reset ----------
+
+fn cmd_reset() -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir = config::config_dir_path();
+    if config_dir.exists() {
+        std::fs::remove_dir_all(&config_dir)?;
+        println!("Removed {}", config_dir.display());
+    } else {
+        println!("Nothing to reset.");
     }
     Ok(())
 }

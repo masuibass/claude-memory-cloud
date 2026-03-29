@@ -31,6 +31,12 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(cfg)
 }
 
+pub fn config_dir_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("memory-cloud")
+}
+
 pub fn tokens_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
