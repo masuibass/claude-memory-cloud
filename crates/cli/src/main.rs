@@ -58,6 +58,12 @@ enum TranscriptAction {
         /// Session ID
         session_id: String,
     },
+    /// Bulk upload all transcripts from ~/.claude/projects
+    BulkUpload {
+        /// Path to ~/.claude/projects (defaults to ~/.claude/projects)
+        #[arg(short, long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -92,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
             TranscriptAction::Get { session_id } => cmd_transcript_get(&session_id).await,
+            TranscriptAction::BulkUpload { path } => cmd_bulk_upload(path.as_deref()).await,
         },
         Command::Sessions { action } => match action {
             SessionsAction::List => cmd_sessions_list().await,
@@ -522,5 +529,121 @@ async fn cmd_shares_list() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+// ---------- bulk upload ----------
+
+async fn cmd_bulk_upload(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let home = std::env::var("HOME")?;
+    let base = match path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from(&home).join(".claude/projects"),
+    };
+
+    if !base.is_dir() {
+        return Err(format!("{} is not a directory", base.display()).into());
+    }
+
+    // Collect all JSONL files: {base}/{project_hash}/{session_id}.jsonl
+    let mut files: Vec<(String, String)> = Vec::new();
+
+    for project_entry in std::fs::read_dir(&base)? {
+        let project_dir = project_entry?.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let project_hash = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if project_hash.is_empty() {
+            continue;
+        }
+
+        for entry in std::fs::read_dir(&project_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                files.push((project_hash.clone(), path.to_string_lossy().to_string()));
+            }
+        }
+    }
+
+    if files.is_empty() {
+        println!("No JSONL files found in {}", base.display());
+        return Ok(());
+    }
+
+    println!("Found {} files to upload", files.len());
+
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+    let mut uploaded = 0u64;
+    let mut failed = 0u64;
+
+    for (i, (project, file_path)) in files.iter().enumerate() {
+        let path = std::path::Path::new(file_path);
+        let session_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => {
+                failed += 1;
+                continue;
+            }
+        };
+
+        let url = format!("{}/transcript", cfg.api_url);
+        let body = serde_json::json!({ "session_id": session_id, "project": project });
+
+        let resp = match authed_request(&client, |token| {
+            client.post(&url).bearer_auth(token).json(&body)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[{}/{}] {} — API error: {e}", i + 1, files.len(), session_id);
+                failed += 1;
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            eprintln!("[{}/{}] {} — {status}", i + 1, files.len(), session_id);
+            failed += 1;
+            continue;
+        }
+
+        let resp_body: serde_json::Value = resp.json().await?;
+        let upload_url = match resp_body["upload_url"].as_str() {
+            Some(u) => u.to_string(),
+            None => {
+                eprintln!("[{}/{}] {} — no upload_url", i + 1, files.len(), session_id);
+                failed += 1;
+                continue;
+            }
+        };
+
+        let file_bytes = std::fs::read(file_path)?;
+        let size = file_bytes.len();
+
+        match client.put(&upload_url).body(file_bytes).send().await {
+            Ok(r) if r.status().is_success() => {
+                println!("[{}/{}] {} ({}) done", i + 1, files.len(), session_id, format_size(size as i64));
+                uploaded += 1;
+            }
+            Ok(r) => {
+                eprintln!("[{}/{}] {} — upload failed: {}", i + 1, files.len(), session_id, r.status());
+                failed += 1;
+            }
+            Err(e) => {
+                eprintln!("[{}/{}] {} — upload error: {e}", i + 1, files.len(), session_id);
+                failed += 1;
+            }
+        }
+    }
+
+    println!("\nDone: {uploaded} uploaded, {failed} failed");
     Ok(())
 }
