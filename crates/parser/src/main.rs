@@ -369,6 +369,14 @@ fn extract_user_text(content: &MessageContent) -> String {
     }
 }
 
+/// Truncate a string at a char boundary, not a byte boundary.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Summarize tool input parameters for the markdown output.
 fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
     let obj = match input.as_object() {
@@ -396,7 +404,7 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
         }
         "Bash" => {
             let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("?");
-            let truncated = if cmd.len() > 200 { &cmd[..200] } else { cmd };
+            let truncated = truncate_str(cmd, 200);
             format!("command={truncated}")
         }
         "Glob" | "Grep" => {
@@ -429,16 +437,18 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
                 .map(|(k, v)| {
                     let val = match v {
                         Value::String(s) => {
-                            if s.len() > 100 {
-                                format!("{}...", &s[..100])
+                            let t = truncate_str(s, 100);
+                            if t.len() < s.len() {
+                                format!("{t}...")
                             } else {
                                 s.clone()
                             }
                         }
                         other => {
                             let s = other.to_string();
-                            if s.len() > 100 {
-                                format!("{}...", &s[..100])
+                            let t = truncate_str(&s, 100);
+                            if t.len() < s.len() {
+                                format!("{t}...")
                             } else {
                                 s
                             }
