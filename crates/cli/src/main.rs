@@ -316,7 +316,13 @@ async fn cmd_recall(query: &str, top_k: i32) -> Result<(), Box<dyn std::error::E
         let score = r["score"].as_f64().unwrap_or(0.0);
         let text = r["text"].as_str().unwrap_or("");
         let preview: String = text.chars().take(200).collect();
+        let meta = &r["metadata"];
+        let project = meta["project"].as_str().unwrap_or("");
+        let created_at = meta["created_at"].as_str().unwrap_or("");
         println!("--- {session_id} (score: {score:.4}) ---");
+        if !project.is_empty() || !created_at.is_empty() {
+            println!("  project: {project}  created: {created_at}");
+        }
         println!("{preview}");
         println!();
     }
