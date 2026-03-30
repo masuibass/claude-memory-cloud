@@ -46,11 +46,13 @@ async fn main() -> Result<(), Error> {
 
     let app = Router::new()
         .route("/config", get(get_config))
+        .route("/whoami", get(get_whoami))
         .route("/transcript", post(post_transcript))
         .route(
             "/transcript/{sid}",
             get(get_transcript).delete(delete_transcript),
         )
+        .route("/transcripts", delete(delete_all_transcripts))
         .route("/sessions", get(get_sessions))
         .route("/recall", post(post_recall))
         .route("/shares", get(get_shares).post(post_share))
@@ -66,7 +68,21 @@ async fn main() -> Result<(), Error> {
 async fn get_config() -> impl IntoResponse {
     let cognito_domain = env::var("COGNITO_DOMAIN").unwrap_or_default();
     let client_id = env::var("COGNITO_CLIENT_ID").unwrap_or_default();
-    Json(json!({ "cognito_domain": cognito_domain, "client_id": client_id }))
+    Json(json!({
+        "cognito_domain": cognito_domain,
+        "client_id": client_id,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+// ---------- GET /whoami ----------
+
+async fn get_whoami(req: Request) -> impl IntoResponse {
+    let user_id = match extract_user_id(&req) {
+        Some(id) => id,
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))),
+    };
+    (StatusCode::OK, Json(json!({ "user_id": user_id })))
 }
 
 // ---------- helpers ----------
@@ -302,20 +318,67 @@ async fn delete_transcript(
         None => return (StatusCode::NOT_FOUND, Json(json!({"error": "transcript not found"}))),
     };
 
-    match state
-        .s3
-        .delete_object()
-        .bucket(&state.transcript_bucket)
-        .key(&key)
-        .send()
-        .await
-    {
+    match state.s3.delete_object().bucket(&state.transcript_bucket).key(&key).send().await {
         Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
         Err(e) => {
             tracing::error!("s3 delete error: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to delete"})))
         }
     }
+}
+
+// ---------- DELETE /transcripts ----------
+
+async fn delete_all_transcripts(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> impl IntoResponse {
+    let caller = match extract_user_id(&req) {
+        Some(id) => id,
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))),
+    };
+
+    let prefix = format!("{caller}/");
+    let mut deleted = 0u64;
+    let mut continuation_token: Option<String> = None;
+
+    loop {
+        let mut list_req = state
+            .s3
+            .list_objects_v2()
+            .bucket(&state.transcript_bucket)
+            .prefix(&prefix)
+            .max_keys(1000);
+        if let Some(token) = &continuation_token {
+            list_req = list_req.continuation_token(token);
+        }
+
+        let output = match list_req.send().await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!("s3 list error: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to list objects"})));
+            }
+        };
+
+        for obj in output.contents() {
+            if let Some(key) = obj.key() {
+                if let Err(e) = state.s3.delete_object().bucket(&state.transcript_bucket).key(key).send().await {
+                    tracing::error!("s3 delete error for {key}: {e}");
+                } else {
+                    deleted += 1;
+                }
+            }
+        }
+
+        if output.is_truncated() == Some(true) {
+            continuation_token = output.next_continuation_token().map(String::from);
+        } else {
+            break;
+        }
+    }
+
+    (StatusCode::OK, Json(json!({ "deleted": deleted })))
 }
 
 // ---------- GET /sessions ----------
@@ -544,8 +607,59 @@ async fn post_recall(
 
 #[derive(Deserialize)]
 struct PostShareReq {
-    /// The user_id (Cognito sub) to share your transcripts with.
-    recipient_id: String,
+    /// The user_id (Cognito sub) or email of the recipient.
+    recipient: String,
+}
+
+/// Resolve a recipient identifier (user_id or email) to a Cognito sub.
+async fn resolve_recipient(
+    state: &AppState,
+    recipient: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    // If it looks like an email, look up by email
+    if recipient.contains('@') {
+        let result = state
+            .cognito
+            .list_users()
+            .user_pool_id(&state.user_pool_id)
+            .filter(format!("email = \"{recipient}\""))
+            .limit(1)
+            .send()
+            .await;
+        match result {
+            Ok(output) => {
+                let user = output.users().first().ok_or_else(|| {
+                    (StatusCode::NOT_FOUND, Json(json!({"error": "user not found for that email"})))
+                })?;
+                let sub = user
+                    .attributes()
+                    .iter()
+                    .find(|a| a.name() == "sub")
+                    .and_then(|a| a.value().map(String::from))
+                    .ok_or_else(|| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "user has no sub"})))
+                    })?;
+                Ok(sub)
+            }
+            Err(e) => {
+                tracing::error!("cognito list_users error: {e}");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to look up user"}))))
+            }
+        }
+    } else {
+        // Treat as user_id (sub), verify it exists
+        match state
+            .cognito
+            .admin_get_user()
+            .user_pool_id(&state.user_pool_id)
+            .username(recipient)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(recipient.to_string()),
+            Err(_) => Err((StatusCode::NOT_FOUND, Json(json!({"error": "recipient user not found"})))),
+        }
+    }
 }
 
 async fn post_share(
@@ -562,29 +676,16 @@ async fn post_share(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
     };
 
-    if body.recipient_id == caller {
+    let recipient_id = match resolve_recipient(&state, &body.recipient).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    if recipient_id == caller {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "cannot share with yourself"})),
         );
-    }
-
-    // Verify recipient exists in Cognito
-    match state
-        .cognito
-        .admin_get_user()
-        .user_pool_id(&state.user_pool_id)
-        .username(&body.recipient_id)
-        .send()
-        .await
-    {
-        Ok(_) => {}
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "recipient user not found"})),
-            );
-        }
     }
 
     use aws_sdk_dynamodb::types::AttributeValue;
@@ -594,10 +695,10 @@ async fn post_share(
         .ddb
         .put_item()
         .table_name(&state.shares_table)
-        .item("pk", AttributeValue::S(body.recipient_id.clone()))
+        .item("pk", AttributeValue::S(recipient_id.clone()))
         .item("sk", AttributeValue::S(format!("share#{}", caller)))
         .item("owner_id", AttributeValue::S(caller.clone()))
-        .item("recipient_id", AttributeValue::S(body.recipient_id.clone()))
+        .item("recipient_id", AttributeValue::S(recipient_id.clone()))
         .send()
         .await
     {
@@ -612,7 +713,7 @@ async fn post_share(
         StatusCode::CREATED,
         Json(json!({
             "owner_id": caller,
-            "recipient_id": body.recipient_id,
+            "recipient_id": recipient_id,
         })),
     )
 }

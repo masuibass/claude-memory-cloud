@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aws-config",
  "aws-sdk-bedrockagentruntime",
@@ -2002,7 +2002,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memory-cloud"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "chrono",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "parser"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "transcript"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",

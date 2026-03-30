@@ -60,6 +60,11 @@ export class ClaudeMemoryStack extends cdk.Stack {
       new s3n.SqsDestination(parserQueue),
       { suffix: ".jsonl" },
     );
+    rawBucket.addEventNotification(
+      s3.EventType.OBJECT_REMOVED,
+      new s3n.SqsDestination(parserQueue),
+      { suffix: ".jsonl" },
+    );
 
     // ========== Parser Lambda ==========
     const parserFn = new lambda.Function(this, "ParserFn", {
@@ -300,6 +305,11 @@ exports.handler = async (event) => {
       new s3n.LambdaDestination(syncFn),
       { suffix: ".md" },
     );
+    parsedBucket.addEventNotification(
+      s3.EventType.OBJECT_REMOVED,
+      new s3n.LambdaDestination(syncFn),
+      { suffix: ".md" },
+    );
 
     // ========== DynamoDB (shares) ==========
     const sharesTable = new dynamodb.Table(this, "SharesTable", {
@@ -349,7 +359,7 @@ exports.handler = async (event) => {
     );
     apiFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["cognito-idp:AdminGetUser"],
+        actions: ["cognito-idp:AdminGetUser", "cognito-idp:ListUsers"],
         resources: [userPool.userPoolArn],
       }),
     );
@@ -374,6 +384,14 @@ exports.handler = async (event) => {
       integration: apiIntegration,
     });
 
+    // /whoami — authenticated
+    httpApi.addRoutes({
+      path: "/whoami",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: apiIntegration,
+      authorizer,
+    });
+
     // /transcript — authenticated
     httpApi.addRoutes({
       path: "/transcript",
@@ -384,6 +402,14 @@ exports.handler = async (event) => {
     httpApi.addRoutes({
       path: "/transcript/{proxy+}",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.DELETE],
+      integration: apiIntegration,
+      authorizer,
+    });
+
+    // /transcripts — authenticated (purge)
+    httpApi.addRoutes({
+      path: "/transcripts",
+      methods: [apigwv2.HttpMethod.DELETE],
       integration: apiIntegration,
       authorizer,
     });

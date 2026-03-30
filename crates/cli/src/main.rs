@@ -4,7 +4,7 @@ mod log;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "memory-cloud", about = "Claude Code shared memory CLI")]
+#[command(name = "memory-cloud", about = "Claude Code shared memory CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -29,6 +29,8 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Show your user ID
+    Whoami,
     /// Semantic search across all transcripts
     Recall {
         /// Search query
@@ -72,6 +74,8 @@ enum TranscriptAction {
         #[arg(long)]
         raw: bool,
     },
+    /// Delete all your transcripts
+    Purge,
     /// Bulk upload all transcripts from ~/.claude/projects
     BulkUpload {
         /// Path to ~/.claude/projects (defaults to ~/.claude/projects)
@@ -90,8 +94,8 @@ enum SessionsAction {
 enum SharesAction {
     /// Share your transcripts with another user
     Add {
-        /// Recipient's user ID (Cognito sub)
-        recipient_id: String,
+        /// Recipient's user ID or email
+        recipient: String,
     },
     /// Revoke a share you received (stop seeing their transcripts)
     Remove {
@@ -126,17 +130,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Logout => cmd_logout(),
         Command::Reset => cmd_reset(),
         Command::Logs { follow } => cmd_logs(follow),
+        Command::Whoami => cmd_whoami().await,
         Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
             TranscriptAction::Get { session_id, raw } => cmd_transcript_get(&session_id, raw).await,
+            TranscriptAction::Purge => cmd_transcript_purge().await,
             TranscriptAction::BulkUpload { path } => cmd_bulk_upload(path.as_deref()).await,
         },
         Command::Sessions { action } => match action {
             SessionsAction::List => cmd_sessions_list().await,
         },
         Command::Shares { action } => match action {
-            SharesAction::Add { recipient_id } => cmd_shares_add(&recipient_id).await,
+            SharesAction::Add { recipient } => cmd_shares_add(&recipient).await,
             SharesAction::Remove { owner_id } => cmd_shares_remove(&owner_id).await,
             SharesAction::Revoke { recipient_id } => cmd_shares_revoke(&recipient_id).await,
             SharesAction::List => cmd_shares_list().await,
@@ -233,6 +239,62 @@ fn cmd_reset() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("Nothing to reset.");
     }
+    Ok(())
+}
+
+// ---------- whoami ----------
+
+async fn cmd_whoami() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+    let url = format!("{}/whoami", cfg.api_url);
+
+    let resp = authed_request(|token| {
+        client.get(&url).bearer_auth(token)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let user_id = body["user_id"].as_str().unwrap_or("unknown");
+    println!("{user_id}");
+    Ok(())
+}
+
+// ---------- transcript purge ----------
+
+async fn cmd_transcript_purge() -> Result<(), Box<dyn std::error::Error>> {
+    eprint!("Delete ALL your transcripts? [y/N] ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if !input.trim().eq_ignore_ascii_case("y") {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let cfg = config::load_config()?;
+    let client = reqwest::Client::new();
+    let url = format!("{}/transcripts", cfg.api_url);
+
+    let resp = authed_request(|token| {
+        client.delete(&url).bearer_auth(token)
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        return Err(format!("{status}: {body}").into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let deleted = body["deleted"].as_u64().unwrap_or(0);
+    println!("Deleted {deleted} transcripts.");
     Ok(())
 }
 
@@ -518,12 +580,12 @@ fn format_size(bytes: i64) -> String {
 
 // ---------- shares add ----------
 
-async fn cmd_shares_add(recipient_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_shares_add(recipient: &str) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
     let client = reqwest::Client::new();
 
     let url = format!("{}/shares", cfg.api_url);
-    let body = serde_json::json!({ "recipient_id": recipient_id });
+    let body = serde_json::json!({ "recipient": recipient });
 
     let resp = authed_request(|token| {
         client.post(&url).bearer_auth(token).json(&body)
@@ -536,6 +598,8 @@ async fn cmd_shares_add(recipient_id: &str) -> Result<(), Box<dyn std::error::Er
         return Err(format!("{status}: {body}").into());
     }
 
+    let resp_body: serde_json::Value = resp.json().await?;
+    let recipient_id = resp_body["recipient_id"].as_str().unwrap_or(recipient);
     println!("Shared your transcripts with {recipient_id}");
     Ok(())
 }

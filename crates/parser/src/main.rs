@@ -22,6 +22,8 @@ struct S3Event {
 
 #[derive(Deserialize)]
 struct S3Record {
+    #[serde(rename = "eventName")]
+    event_name: Option<String>,
     s3: S3Info,
 }
 
@@ -109,20 +111,47 @@ async fn handle_sqs(event: SqsEvent, s3: &S3Client, parsed_bucket: &str) -> Resu
             let key = urlencoding::decode(&s3_record.s3.object.key)
                 .unwrap_or_default()
                 .into_owned();
+            let event_name = s3_record.event_name.as_deref().unwrap_or("");
 
-            tracing::info!(bucket = bucket, key = key, "processing");
+            tracing::info!(bucket = bucket, key = key, event = event_name, "processing");
 
             if !key.ends_with(".jsonl") {
                 tracing::info!(key = key, "skipping non-jsonl");
                 continue;
             }
 
-            match process_object(s3, bucket, &key, parsed_bucket).await {
-                Ok(()) => tracing::info!(key = key, "done"),
-                Err(e) => tracing::error!(key = key, error = %e, "failed"),
+            if event_name.contains("ObjectRemoved") {
+                match delete_parsed(s3, &key, parsed_bucket).await {
+                    Ok(()) => tracing::info!(key = key, "deleted parsed"),
+                    Err(e) => tracing::error!(key = key, error = %e, "failed to delete parsed"),
+                }
+            } else {
+                match process_object(s3, bucket, &key, parsed_bucket).await {
+                    Ok(()) => tracing::info!(key = key, "done"),
+                    Err(e) => tracing::error!(key = key, error = %e, "failed"),
+                }
             }
         }
     }
+    Ok(())
+}
+
+// ============================================================
+// Delete parsed objects (.md + .metadata.json)
+// ============================================================
+
+async fn delete_parsed(
+    s3: &S3Client,
+    raw_key: &str,
+    parsed_bucket: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (user_id, project, session_id) = parse_s3_key(raw_key)?;
+    let md_key = format!("{user_id}/{project}/{session_id}.md");
+    let metadata_key = format!("{md_key}.metadata.json");
+
+    s3.delete_object().bucket(parsed_bucket).key(&md_key).send().await?;
+    s3.delete_object().bucket(parsed_bucket).key(&metadata_key).send().await?;
+
     Ok(())
 }
 
