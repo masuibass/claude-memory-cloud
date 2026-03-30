@@ -8,6 +8,8 @@ user-invocable: true
 
 Claude Code セッションの transcript を管理します。
 
+**重要**: コマンドはユーザーの作業ディレクトリで実行してください。このスキルのディレクトリに cd しないでください。
+
 ## 使い方
 
 ### `/transcript put <file>`
