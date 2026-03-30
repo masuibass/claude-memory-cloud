@@ -61,7 +61,7 @@ enum TranscriptAction {
         /// Path to the JSONL file
         file: String,
         /// Project identifier (directory name from ~/.claude/projects/)
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         project: Option<String>,
     },
     /// Download a transcript
@@ -69,7 +69,7 @@ enum TranscriptAction {
         /// Session ID
         session_id: String,
         /// Project identifier
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         project: String,
         /// Get raw JSONL instead of parsed Markdown
         #[arg(long)]
