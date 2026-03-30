@@ -112,13 +112,3 @@ pub async fn refresh_tokens() -> Result<String, Box<dyn std::error::Error>> {
         .ok_or("no token in refresh response")?;
     Ok(token.to_string())
 }
-
-/// Extract the `sub` claim from a JWT without verification (for user_id).
-pub fn extract_sub_from_token(token: &str) -> Result<String, Box<dyn std::error::Error>> {
-    use base64::Engine;
-    let payload = token.split('.').nth(1).ok_or("invalid JWT")?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload)?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded)?;
-    let sub = claims["sub"].as_str().ok_or("no sub in JWT")?;
-    Ok(sub.to_string())
-}

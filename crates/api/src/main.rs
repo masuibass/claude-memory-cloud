@@ -48,7 +48,7 @@ async fn main() -> Result<(), Error> {
         .route("/config", get(get_config))
         .route("/transcript", post(post_transcript))
         .route(
-            "/transcript/{user_id}/{project}/{sid}",
+            "/transcript/{sid}",
             get(get_transcript).delete(delete_transcript),
         )
         .route("/sessions", get(get_sessions))
@@ -174,11 +174,57 @@ struct TranscriptGetQuery {
     raw: Option<bool>,
 }
 
-// ---------- GET /transcript/{user_id}/{project}/{sid} ----------
+/// Search S3 for a transcript by session_id across the given user_ids.
+/// Returns (user_id, full_key) if found.
+async fn find_transcript_key(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    user_ids: &[String],
+    session_id: &str,
+) -> Option<(String, String)> {
+    let suffix = format!("/{session_id}.jsonl");
+    for user_id in user_ids {
+        let prefix = format!("{user_id}/");
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut req = s3
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&prefix)
+                .max_keys(1000);
+            if let Some(token) = &continuation_token {
+                req = req.continuation_token(token);
+            }
+            match req.send().await {
+                Ok(output) => {
+                    for obj in output.contents() {
+                        if let Some(key) = obj.key() {
+                            if key.ends_with(&suffix) {
+                                return Some((user_id.clone(), key.to_string()));
+                            }
+                        }
+                    }
+                    if output.is_truncated() == Some(true) {
+                        continuation_token = output.next_continuation_token().map(String::from);
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("s3 list error for {user_id}: {e}");
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------- GET /transcript/{sid} ----------
 
 async fn get_transcript(
     State(state): State<Arc<AppState>>,
-    Path((user_id, project, sid)): Path<(String, String, String)>,
+    Path(sid): Path<String>,
     Query(query): Query<TranscriptGetQuery>,
     req: Request,
 ) -> impl IntoResponse {
@@ -187,14 +233,23 @@ async fn get_transcript(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))),
     };
 
-    if caller != user_id {
-        return (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"})));
-    }
+    let user_ids = match get_searchable_user_ids(&state, &caller).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("ddb query error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to query shares"})));
+        }
+    };
+
+    let (owner, raw_key) = match find_transcript_key(&state.s3, &state.transcript_bucket, &user_ids, &sid).await {
+        Some(found) => found,
+        None => return (StatusCode::NOT_FOUND, Json(json!({"error": "transcript not found"}))),
+    };
 
     let (bucket, key) = if query.raw.unwrap_or(false) {
-        (&state.transcript_bucket, format!("{}/{}/{}.jsonl", user_id, project, sid))
+        (&state.transcript_bucket, raw_key.clone())
     } else {
-        (&state.parsed_bucket, format!("{}/{}/{}.md", user_id, project, sid))
+        (&state.parsed_bucket, raw_key.replace(".jsonl", ".md"))
     };
 
     let presigned_config = aws_sdk_s3::presigning::PresigningConfig::builder()
@@ -210,10 +265,17 @@ async fn get_transcript(
         .presigned(presigned_config)
         .await
     {
-        Ok(presigned) => (
-            StatusCode::OK,
-            Json(json!({ "download_url": presigned.uri() })),
-        ),
+        Ok(presigned) => {
+            // Extract project from key: {user_id}/{project}/{sid}.jsonl
+            let project = raw_key
+                .strip_prefix(&format!("{owner}/"))
+                .and_then(|rest| rest.strip_suffix(&format!("/{sid}.jsonl")))
+                .unwrap_or("");
+            (
+                StatusCode::OK,
+                Json(json!({ "download_url": presigned.uri(), "user_id": owner, "project": project })),
+            )
+        }
         Err(e) => {
             tracing::error!("presign error: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to generate presigned url"})))
@@ -221,23 +283,24 @@ async fn get_transcript(
     }
 }
 
-// ---------- DELETE /transcript/{user_id}/{project}/{sid} ----------
+// ---------- DELETE /transcript/{sid} ----------
 
 async fn delete_transcript(
     State(state): State<Arc<AppState>>,
-    Path((user_id, project, sid)): Path<(String, String, String)>,
+    Path(sid): Path<String>,
     req: Request,
 ) -> impl IntoResponse {
     let caller = match extract_user_id(&req) {
         Some(id) => id,
-        None => return StatusCode::UNAUTHORIZED,
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))),
     };
 
-    if caller != user_id {
-        return StatusCode::FORBIDDEN;
-    }
-
-    let key = format!("{}/{}/{}.jsonl", user_id, project, sid);
+    // Only search caller's own transcripts (cannot delete shared ones)
+    let own = vec![caller.clone()];
+    let (_, key) = match find_transcript_key(&state.s3, &state.transcript_bucket, &own, &sid).await {
+        Some(found) => found,
+        None => return (StatusCode::NOT_FOUND, Json(json!({"error": "transcript not found"}))),
+    };
 
     match state
         .s3
@@ -247,10 +310,10 @@ async fn delete_transcript(
         .send()
         .await
     {
-        Ok(_) => StatusCode::NO_CONTENT,
+        Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
         Err(e) => {
             tracing::error!("s3 delete error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to delete"})))
         }
     }
 }

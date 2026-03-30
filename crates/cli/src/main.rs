@@ -68,9 +68,6 @@ enum TranscriptAction {
     Get {
         /// Session ID
         session_id: String,
-        /// Project identifier
-        #[arg(short, long, allow_hyphen_values = true)]
-        project: String,
         /// Get raw JSONL instead of parsed Markdown
         #[arg(long)]
         raw: bool,
@@ -132,7 +129,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
-            TranscriptAction::Get { session_id, project, raw } => cmd_transcript_get(&session_id, &project, raw).await,
+            TranscriptAction::Get { session_id, raw } => cmd_transcript_get(&session_id, raw).await,
             TranscriptAction::BulkUpload { path } => cmd_bulk_upload(path.as_deref()).await,
         },
         Command::Sessions { action } => match action {
@@ -444,13 +441,11 @@ async fn cmd_transcript_put(
 
 // ---------- transcript get ----------
 
-async fn cmd_transcript_get(session_id: &str, project: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_transcript_get(session_id: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
-    let token = config::load_id_token()?;
-    let user_id = config::extract_sub_from_token(&token)?;
     let client = reqwest::Client::new();
 
-    let mut url = format!("{}/transcript/{}/{}/{}", cfg.api_url, user_id, project, session_id);
+    let mut url = format!("{}/transcript/{}", cfg.api_url, session_id);
     if raw {
         url.push_str("?raw=true");
     }

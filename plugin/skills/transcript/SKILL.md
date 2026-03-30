@@ -24,18 +24,19 @@ memory-cloud transcript put <file>
 memory-cloud transcript put <file> --project <project_hash>
 ```
 
-### `/transcript get <session_id> --project <project_hash>`
+### `/transcript get <session_id>`
 
 transcript をダウンロードして表示します。デフォルトは parsed (Markdown) 形式です。
+共有を受けた他ユーザーの transcript も取得できます。
 
 ```bash
-memory-cloud transcript get <session_id> --project <project_hash>
+memory-cloud transcript get <session_id>
 ```
 
 生の JSONL が必要な場合は `--raw` を付けます:
 
 ```bash
-memory-cloud transcript get <session_id> --project <project_hash> --raw
+memory-cloud transcript get <session_id> --raw
 ```
 
 ### `/transcript bulk-upload`
