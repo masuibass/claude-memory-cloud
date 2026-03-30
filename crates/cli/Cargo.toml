@@ -22,3 +22,5 @@ rand = "0.9"
 tiny_http = "0.12"
 open = "5"
 chrono.workspace = true
+flate2 = "1"
+tar = "0.4"

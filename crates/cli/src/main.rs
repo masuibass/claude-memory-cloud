@@ -4,7 +4,11 @@ mod log;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "memory-cloud", about = "Claude Code shared memory CLI", version)]
+#[command(
+    name = "memory-cloud",
+    about = "Claude Code shared memory CLI",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -23,6 +27,8 @@ enum Command {
     Logout,
     /// Remove all local config and tokens
     Reset,
+    /// Update CLI to the latest version
+    Update,
     /// Show CLI log file path or tail logs
     Logs {
         /// Follow log output (tail -f)
@@ -118,7 +124,10 @@ enum SharesAction {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::init();
     let cli = Cli::parse();
-    log::info(&format!("command: {:?}", std::env::args().collect::<Vec<_>>()));
+    log::info(&format!(
+        "command: {:?}",
+        std::env::args().collect::<Vec<_>>()
+    ));
     let result = run(cli).await;
     if let Err(ref e) = result {
         log::error(&format!("{e}"));
@@ -132,11 +141,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Login => cmd_login().await,
         Command::Logout => cmd_logout(),
         Command::Reset => cmd_reset(),
+        Command::Update => cmd_update().await,
         Command::Logs { follow } => cmd_logs(follow),
         Command::Whoami => cmd_whoami().await,
         Command::Recall { query, top_k, user } => cmd_recall(&query, top_k, user.as_deref()).await,
         Command::Transcript { action } => match action {
-            TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
+            TranscriptAction::Put { file, project } => {
+                cmd_transcript_put(&file, project.as_deref()).await
+            }
             TranscriptAction::Get { session_id, raw } => cmd_transcript_get(&session_id, raw).await,
             TranscriptAction::Purge => cmd_transcript_purge().await,
             TranscriptAction::BulkUpload { path } => cmd_bulk_upload(path.as_deref()).await,
@@ -245,6 +257,153 @@ fn cmd_reset() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ---------- update ----------
+
+async fn cmd_update() -> Result<(), Box<dyn std::error::Error>> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    println!("Current version: {current_version}");
+
+    let client = reqwest::Client::builder()
+        .user_agent("memory-cloud")
+        .build()?;
+
+    // Fetch latest release from GitHub
+    let resp: serde_json::Value = client
+        .get("https://api.github.com/repos/masuibass/claude-memory-cloud/releases/latest")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let latest = resp["tag_name"]
+        .as_str()
+        .ok_or("failed to get latest version")?
+        .trim_start_matches('v');
+
+    if latest == current_version {
+        println!("Already up to date.");
+        return Ok(());
+    }
+
+    println!("Latest version: {latest}");
+
+    // Determine platform asset name
+    let target = match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("aarch64", "macos") => "aarch64-apple-darwin",
+        ("x86_64", "macos") => "x86_64-apple-darwin",
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
+        (arch, os) => return Err(format!("unsupported platform: {os}/{arch}").into()),
+    };
+    let asset_name = format!("memory-cloud-{target}.tar.gz");
+
+    // Find download URL
+    let download_url = resp["assets"]
+        .as_array()
+        .and_then(|assets| {
+            assets.iter().find_map(|a| {
+                if a["name"].as_str() == Some(&asset_name) {
+                    a["browser_download_url"].as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| format!("asset {asset_name} not found in release"))?;
+
+    // Also find checksum URL
+    let checksum_name = format!("{asset_name}.sha256");
+    let checksum_url = resp["assets"].as_array().and_then(|assets| {
+        assets.iter().find_map(|a| {
+            if a["name"].as_str() == Some(&checksum_name) {
+                a["browser_download_url"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+    });
+
+    println!("Downloading {asset_name}...");
+
+    // Download archive
+    let bytes = client.get(&download_url).send().await?.bytes().await?;
+
+    // Verify SHA256 checksum
+    if let Some(url) = checksum_url {
+        let expected = client.get(&url).send().await?.text().await?;
+        let expected_hash = expected.split_whitespace().next().unwrap_or("");
+        use sha2::Digest;
+        let actual_hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+        if actual_hash != expected_hash {
+            return Err(
+                format!("checksum mismatch: expected {expected_hash}, got {actual_hash}").into(),
+            );
+        }
+        println!("Checksum verified.");
+    }
+
+    // Save archive to temp for attestation verification
+    let tmp_dir = std::env::temp_dir();
+    let archive_path = tmp_dir.join(&asset_name);
+    std::fs::write(&archive_path, &bytes)?;
+
+    // Verify attestation with gh CLI (if available)
+    if let Ok(output) = std::process::Command::new("gh")
+        .args([
+            "attestation",
+            "verify",
+            &archive_path.to_string_lossy(),
+            "--repo",
+            "masuibass/claude-memory-cloud",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            println!("Attestation verified.");
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Attestation verification failed: {stderr}");
+            eprintln!("Proceeding anyway (gh attestation may not be available for this release).");
+        }
+    }
+
+    // Extract tar.gz
+    let decoder = flate2::read::GzDecoder::new(bytes.as_ref());
+    let mut archive = tar::Archive::new(decoder);
+
+    // Find current binary path
+    let current_exe = std::env::current_exe()?;
+    let current_exe = current_exe.canonicalize()?;
+
+    // Extract the binary to a temp file next to current exe
+    let tmp_path = current_exe.with_extension("tmp");
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        if path.file_name().and_then(|n| n.to_str()) == Some("memory-cloud") {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            std::io::copy(&mut entry, &mut file)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            break;
+        }
+    }
+
+    if !tmp_path.exists() {
+        let _ = std::fs::remove_file(&archive_path);
+        return Err("binary not found in archive".into());
+    }
+
+    // Replace current binary
+    std::fs::rename(&tmp_path, &current_exe)?;
+    let _ = std::fs::remove_file(&archive_path);
+    println!("Updated to v{latest}");
+    Ok(())
+}
+
 // ---------- whoami ----------
 
 async fn cmd_whoami() -> Result<(), Box<dyn std::error::Error>> {
@@ -252,10 +411,7 @@ async fn cmd_whoami() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let url = format!("{}/whoami", cfg.api_url);
 
-    let resp = authed_request(|token| {
-        client.get(&url).bearer_auth(token)
-    })
-    .await?;
+    let resp = authed_request(|token| client.get(&url).bearer_auth(token)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -284,10 +440,7 @@ async fn cmd_transcript_purge() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let url = format!("{}/transcripts", cfg.api_url);
 
-    let resp = authed_request(|token| {
-        client.delete(&url).bearer_auth(token)
-    })
-    .await?;
+    let resp = authed_request(|token| client.delete(&url).bearer_auth(token)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -314,10 +467,7 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
 
     let auth_url = format!(
         "https://{}/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid+email+profile&code_challenge={}&code_challenge_method=S256",
-        cfg.cognito_domain,
-        cfg.client_id,
-        "http://localhost:8976/callback",
-        challenge,
+        cfg.cognito_domain, cfg.client_id, "http://localhost:8976/callback", challenge,
     );
 
     println!("Opening browser for authentication...");
@@ -337,7 +487,11 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
     let response = tiny_http::Response::from_string(
         "<html><body><h2>Login successful!</h2><p>You can close this tab.</p></body></html>",
     )
-    .with_header("Content-Type: text/html".parse::<tiny_http::Header>().unwrap());
+    .with_header(
+        "Content-Type: text/html"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
     let _ = request.respond(response);
 
     let client = reqwest::Client::new();
@@ -384,7 +538,11 @@ fn base64_url_encode(data: &[u8]) -> String {
 
 // ---------- recall ----------
 
-async fn cmd_recall(query: &str, top_k: i32, user: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_recall(
+    query: &str,
+    top_k: i32,
+    user: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
     let client = reqwest::Client::new();
 
@@ -394,10 +552,7 @@ async fn cmd_recall(query: &str, top_k: i32, user: Option<&str>) -> Result<(), B
         body["user"] = serde_json::json!(u);
     }
 
-    let resp = authed_request(|token| {
-        client.post(&url).bearer_auth(token).json(&body)
-    })
-    .await?;
+    let resp = authed_request(|token| client.post(&url).bearer_auth(token).json(&body)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -478,10 +633,7 @@ async fn cmd_transcript_put(
     let url = format!("{}/transcript", cfg.api_url);
     let body = serde_json::json!({ "session_id": session_id, "project": project });
 
-    let resp = authed_request(|token| {
-        client.post(&url).bearer_auth(token).json(&body)
-    })
-    .await?;
+    let resp = authed_request(|token| client.post(&url).bearer_auth(token).json(&body)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -490,9 +642,7 @@ async fn cmd_transcript_put(
     }
 
     let resp_body: serde_json::Value = resp.json().await?;
-    let upload_url = resp_body["upload_url"]
-        .as_str()
-        .ok_or("no upload_url")?;
+    let upload_url = resp_body["upload_url"].as_str().ok_or("no upload_url")?;
 
     let file_bytes = std::fs::read(file)?;
     let size = file_bytes.len();
@@ -519,10 +669,7 @@ async fn cmd_transcript_get(session_id: &str, raw: bool) -> Result<(), Box<dyn s
         url.push_str("?raw=true");
     }
 
-    let resp = authed_request(|token| {
-        client.get(&url).bearer_auth(token)
-    })
-    .await?;
+    let resp = authed_request(|token| client.get(&url).bearer_auth(token)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -546,10 +693,7 @@ async fn cmd_sessions_list() -> Result<(), Box<dyn std::error::Error>> {
 
     let url = format!("{}/sessions", cfg.api_url);
 
-    let resp = authed_request(|token| {
-        client.get(&url).bearer_auth(token)
-    })
-    .await?;
+    let resp = authed_request(|token| client.get(&url).bearer_auth(token)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -594,10 +738,7 @@ async fn cmd_shares_add(recipient: &str) -> Result<(), Box<dyn std::error::Error
     let url = format!("{}/shares", cfg.api_url);
     let body = serde_json::json!({ "recipient": recipient });
 
-    let resp = authed_request(|token| {
-        client.post(&url).bearer_auth(token).json(&body)
-    })
-    .await?;
+    let resp = authed_request(|token| client.post(&url).bearer_auth(token).json(&body)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -619,10 +760,7 @@ async fn cmd_shares_remove(owner_id: &str) -> Result<(), Box<dyn std::error::Err
 
     let url = format!("{}/shares/{}", cfg.api_url, owner_id);
 
-    let resp = authed_request(|token| {
-        client.delete(&url).bearer_auth(token)
-    })
-    .await?;
+    let resp = authed_request(|token| client.delete(&url).bearer_auth(token)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -642,10 +780,7 @@ async fn cmd_shares_revoke(recipient_id: &str) -> Result<(), Box<dyn std::error:
 
     let url = format!("{}/shares/recipients/{}", cfg.api_url, recipient_id);
 
-    let resp = authed_request(|token| {
-        client.delete(&url).bearer_auth(token)
-    })
-    .await?;
+    let resp = authed_request(|token| client.delete(&url).bearer_auth(token)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -665,10 +800,7 @@ async fn cmd_shares_list() -> Result<(), Box<dyn std::error::Error>> {
 
     let url = format!("{}/shares", cfg.api_url);
 
-    let resp = authed_request(|token| {
-        client.get(&url).bearer_auth(token)
-    })
-    .await?;
+    let resp = authed_request(|token| client.get(&url).bearer_auth(token)).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -681,8 +813,8 @@ async fn cmd_shares_list() -> Result<(), Box<dyn std::error::Error>> {
     let shared_with_me = body["shared_with_me"].as_array();
     let shared_by_me = body["shared_by_me"].as_array();
 
-    let is_empty = shared_with_me.is_none_or(|a| a.is_empty())
-        && shared_by_me.is_none_or(|a| a.is_empty());
+    let is_empty =
+        shared_with_me.is_none_or(|a| a.is_empty()) && shared_by_me.is_none_or(|a| a.is_empty());
 
     if is_empty {
         println!("No shares found.");
@@ -781,18 +913,20 @@ async fn cmd_bulk_upload(path: Option<&str>) -> Result<(), Box<dyn std::error::E
         let url = format!("{}/transcript", cfg.api_url);
         let body = serde_json::json!({ "session_id": session_id, "project": project });
 
-        let resp = match authed_request(|token| {
-            client.post(&url).bearer_auth(token).json(&body)
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[{}/{}] {} — API error: {e}", i + 1, files.len(), session_id);
-                failed += 1;
-                continue;
-            }
-        };
+        let resp =
+            match authed_request(|token| client.post(&url).bearer_auth(token).json(&body)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "[{}/{}] {} — API error: {e}",
+                        i + 1,
+                        files.len(),
+                        session_id
+                    );
+                    failed += 1;
+                    continue;
+                }
+            };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -816,15 +950,32 @@ async fn cmd_bulk_upload(path: Option<&str>) -> Result<(), Box<dyn std::error::E
 
         match client.put(&upload_url).body(file_bytes).send().await {
             Ok(r) if r.status().is_success() => {
-                println!("[{}/{}] {} ({}) done", i + 1, files.len(), session_id, format_size(size as i64));
+                println!(
+                    "[{}/{}] {} ({}) done",
+                    i + 1,
+                    files.len(),
+                    session_id,
+                    format_size(size as i64)
+                );
                 uploaded += 1;
             }
             Ok(r) => {
-                eprintln!("[{}/{}] {} — upload failed: {}", i + 1, files.len(), session_id, r.status());
+                eprintln!(
+                    "[{}/{}] {} — upload failed: {}",
+                    i + 1,
+                    files.len(),
+                    session_id,
+                    r.status()
+                );
                 failed += 1;
             }
             Err(e) => {
-                eprintln!("[{}/{}] {} — upload error: {e}", i + 1, files.len(), session_id);
+                eprintln!(
+                    "[{}/{}] {} — upload error: {e}",
+                    i + 1,
+                    files.len(),
+                    session_id
+                );
                 failed += 1;
             }
         }

@@ -47,8 +47,10 @@ jobs:
           tar czf ../../../memory-cloud-${{ matrix.target }}.tar.gz memory-cloud
           cd ../../..
 
+      - name: Generate checksum
+        run: shasum -a 256 memory-cloud-${{ matrix.target }}.tar.gz > memory-cloud-${{ matrix.target }}.tar.gz.sha256
+
       - name: Attest build provenance
-        continue-on-error: true
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: memory-cloud-${{ matrix.target }}.tar.gz
@@ -57,7 +59,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: memory-cloud-${{ matrix.target }}
-          path: memory-cloud-${{ matrix.target }}.tar.gz
+          path: |
+            memory-cloud-${{ matrix.target }}.tar.gz
+            memory-cloud-${{ matrix.target }}.tar.gz.sha256
 
   release:
     needs: build
@@ -71,4 +75,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: memory-cloud-*.tar.gz
+          files: |
+            memory-cloud-*.tar.gz
+            memory-cloud-*.tar.gz.sha256
