@@ -464,6 +464,8 @@ struct RecallReq {
     query: String,
     #[serde(default = "default_top_k")]
     top_k: i32,
+    /// Optional: filter to a specific user (user_id, email, or "me")
+    user: Option<String>,
 }
 
 fn default_top_k() -> i32 {
@@ -489,16 +491,39 @@ async fn post_recall(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
     };
 
-    // Get searchable user_ids (caller + shared owners)
-    let user_ids = match get_searchable_user_ids(&state, &caller).await {
-        Ok(ids) => ids,
-        Err(e) => {
-            tracing::error!("ddb query error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "failed to query shares"})),
-            );
+    // Determine which user_ids to search
+    let user_ids = match &body.user {
+        Some(u) if u == "me" => vec![caller.clone()],
+        Some(u) => {
+            // Resolve the specified user
+            let target_id = if u.contains('@') {
+                match resolve_recipient(&state, u).await {
+                    Ok(id) => id,
+                    Err(resp) => return resp,
+                }
+            } else {
+                u.clone()
+            };
+            // Verify caller has access to this user's transcripts
+            let searchable = match get_searchable_user_ids(&state, &caller).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!("ddb query error: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to query shares"})));
+                }
+            };
+            if !searchable.contains(&target_id) {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": "no access to this user's transcripts"})));
+            }
+            vec![target_id]
         }
+        None => match get_searchable_user_ids(&state, &caller).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!("ddb query error: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to query shares"})));
+            }
+        },
     };
 
     use aws_sdk_bedrockagentruntime::types::{
@@ -743,7 +768,7 @@ async fn get_shares(
         .send()
         .await;
 
-    let shared_with_me: Vec<String> = received
+    let shared_with_me_ids: Vec<String> = received
         .ok()
         .and_then(|r| r.items)
         .unwrap_or_default()
@@ -766,7 +791,7 @@ async fn get_shares(
         .send()
         .await;
 
-    let shared_by_me: Vec<String> = given
+    let shared_by_me_ids: Vec<String> = given
         .ok()
         .and_then(|r| r.items)
         .unwrap_or_default()
@@ -778,6 +803,18 @@ async fn get_shares(
         })
         .collect();
 
+    // Resolve user_ids to emails
+    let mut shared_with_me = Vec::new();
+    for id in &shared_with_me_ids {
+        let email = resolve_email(&state.cognito, &state.user_pool_id, id).await;
+        shared_with_me.push(json!({"id": id, "email": email}));
+    }
+    let mut shared_by_me = Vec::new();
+    for id in &shared_by_me_ids {
+        let email = resolve_email(&state.cognito, &state.user_pool_id, id).await;
+        shared_by_me.push(json!({"id": id, "email": email}));
+    }
+
     (
         StatusCode::OK,
         Json(json!({
@@ -785,6 +822,25 @@ async fn get_shares(
             "shared_by_me": shared_by_me,
         })),
     )
+}
+
+async fn resolve_email(
+    cognito: &aws_sdk_cognitoidentityprovider::Client,
+    user_pool_id: &str,
+    user_id: &str,
+) -> Option<String> {
+    let result = cognito
+        .admin_get_user()
+        .user_pool_id(user_pool_id)
+        .username(user_id)
+        .send()
+        .await
+        .ok()?;
+    result
+        .user_attributes()
+        .iter()
+        .find(|a| a.name() == "email")
+        .and_then(|a| a.value().map(String::from))
 }
 
 // ---------- DELETE /shares/{owner_id} ----------

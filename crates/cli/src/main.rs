@@ -38,6 +38,9 @@ enum Command {
         /// Number of results
         #[arg(short = 'k', long, default_value = "5")]
         top_k: i32,
+        /// Filter by user: "me", user ID, or email (default: all accessible)
+        #[arg(short, long)]
+        user: Option<String>,
     },
     /// Transcript operations
     Transcript {
@@ -131,7 +134,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Reset => cmd_reset(),
         Command::Logs { follow } => cmd_logs(follow),
         Command::Whoami => cmd_whoami().await,
-        Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
+        Command::Recall { query, top_k, user } => cmd_recall(&query, top_k, user.as_deref()).await,
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
             TranscriptAction::Get { session_id, raw } => cmd_transcript_get(&session_id, raw).await,
@@ -381,12 +384,15 @@ fn base64_url_encode(data: &[u8]) -> String {
 
 // ---------- recall ----------
 
-async fn cmd_recall(query: &str, top_k: i32) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_recall(query: &str, top_k: i32, user: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
     let client = reqwest::Client::new();
 
     let url = format!("{}/recall", cfg.api_url);
-    let body = serde_json::json!({ "query": query, "top_k": top_k });
+    let mut body = serde_json::json!({ "query": query, "top_k": top_k });
+    if let Some(u) = user {
+        body["user"] = serde_json::json!(u);
+    }
 
     let resp = authed_request(|token| {
         client.post(&url).bearer_auth(token).json(&body)
@@ -413,14 +419,15 @@ async fn cmd_recall(query: &str, top_k: i32) -> Result<(), Box<dyn std::error::E
         let text = r["text"].as_str().unwrap_or("");
         let preview: String = text.chars().take(200).collect();
         let meta = &r["metadata"];
+        let user_id = meta["user_id"].as_str().unwrap_or("");
         let project = meta["project"].as_str().unwrap_or("");
         let created_at = meta["created_at"].as_str().unwrap_or("");
-        println!("--- {session_id} (score: {score:.4}) ---");
-        if !project.is_empty() || !created_at.is_empty() {
-            println!("  project: {project}  created: {created_at}");
+        println!("\n\x1b[1;36m[{session_id}]\x1b[0m  score: {score:.4}");
+        if !user_id.is_empty() || !project.is_empty() || !created_at.is_empty() {
+            println!("\x1b[2m  user: {user_id}  project: {project}  created: {created_at}\x1b[0m");
         }
-        println!("{preview}");
         println!();
+        println!("{preview}");
     }
     Ok(())
 }
@@ -671,32 +678,40 @@ async fn cmd_shares_list() -> Result<(), Box<dyn std::error::Error>> {
 
     let body: serde_json::Value = resp.json().await?;
 
-    let shared_with_me = body["shared_with_me"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let shared_with_me = body["shared_with_me"].as_array();
+    let shared_by_me = body["shared_by_me"].as_array();
 
-    let shared_by_me = body["shared_by_me"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let is_empty = shared_with_me.is_none_or(|a| a.is_empty())
+        && shared_by_me.is_none_or(|a| a.is_empty());
 
-    if shared_with_me.is_empty() && shared_by_me.is_empty() {
+    if is_empty {
         println!("No shares found.");
         return Ok(());
     }
 
-    if !shared_with_me.is_empty() {
+    if let Some(entries) = shared_with_me.filter(|a| !a.is_empty()) {
         println!("Shared with me (I can search their transcripts):");
-        for id in &shared_with_me {
-            println!("  {id}");
+        for entry in entries {
+            let id = entry["id"].as_str().unwrap_or("?");
+            let email = entry["email"].as_str().unwrap_or("");
+            if email.is_empty() {
+                println!("  {id}");
+            } else {
+                println!("  {id}  ({email})");
+            }
         }
     }
 
-    if !shared_by_me.is_empty() {
+    if let Some(entries) = shared_by_me.filter(|a| !a.is_empty()) {
         println!("Shared by me (they can search my transcripts):");
-        for id in &shared_by_me {
-            println!("  {id}");
+        for entry in entries {
+            let id = entry["id"].as_str().unwrap_or("?");
+            let email = entry["email"].as_str().unwrap_or("");
+            if email.is_empty() {
+                println!("  {id}");
+            } else {
+                println!("  {id}  ({email})");
+            }
         }
     }
 

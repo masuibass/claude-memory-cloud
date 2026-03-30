@@ -1,6 +1,6 @@
 ---
 name: transcript
-description: transcript のアップロード・ダウンロード・一括アップロード
+description: transcript のアップロード・ダウンロード・削除・一括アップロード
 user-invocable: true
 ---
 
@@ -37,6 +37,15 @@ memory-cloud transcript get <session_id>
 
 ```bash
 memory-cloud transcript get <session_id> --raw
+```
+
+### `/transcript purge`
+
+自分の全 transcript を削除します。確認プロンプトが表示されます。
+削除後、パイプライン経由で parsed データと RAG (Knowledge Base) も更新されます。
+
+```bash
+memory-cloud transcript purge
 ```
 
 ### `/transcript bulk-upload`
