@@ -18,6 +18,10 @@ fn log_dir() -> PathBuf {
     }
 }
 
+pub fn log_path() -> PathBuf {
+    log_dir().join("cli.log")
+}
+
 pub fn init() {
     LOG_PATH.get_or_init(|| {
         let dir = log_dir();

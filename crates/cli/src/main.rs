@@ -23,6 +23,12 @@ enum Command {
     Logout,
     /// Remove all local config and tokens
     Reset,
+    /// Show CLI log file path or tail logs
+    Logs {
+        /// Follow log output (tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Semantic search across all transcripts
     Recall {
         /// Search query
@@ -122,6 +128,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Login => cmd_login().await,
         Command::Logout => cmd_logout(),
         Command::Reset => cmd_reset(),
+        Command::Logs { follow } => cmd_logs(follow),
         Command::Recall { query, top_k } => cmd_recall(&query, top_k).await,
         Command::Transcript { action } => match action {
             TranscriptAction::Put { file, project } => cmd_transcript_put(&file, project.as_deref()).await,
@@ -196,6 +203,25 @@ fn cmd_logout() -> Result<(), Box<dyn std::error::Error>> {
         println!("Logged out.");
     } else {
         println!("Not logged in.");
+    }
+    Ok(())
+}
+
+// ---------- logs ----------
+
+fn cmd_logs(follow: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let path = log::log_path();
+    if !path.exists() {
+        println!("No logs yet: {}", path.display());
+        return Ok(());
+    }
+    if follow {
+        let status = std::process::Command::new("tail")
+            .args(["-f", &path.to_string_lossy()])
+            .status()?;
+        std::process::exit(status.code().unwrap_or(0));
+    } else {
+        print!("{}", std::fs::read_to_string(&path)?);
     }
     Ok(())
 }
