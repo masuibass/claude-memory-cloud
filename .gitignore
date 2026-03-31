@@ -5,4 +5,5 @@ cdk/cdk.context.json
 .env*
 *.pem
 *.key
-CLAUDE.md
+# Claude Code (local settings は除外、CLAUDE.md と settings.json はコミット)
+.claude/settings.local.json
